@@ -32,7 +32,6 @@ def _load_dotenv():
 _load_dotenv()
 
 def _env(key, default):
-    return os.environ.get(key, default)
 
 # -- config (env vars override these) --
 

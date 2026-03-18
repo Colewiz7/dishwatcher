@@ -1,3 +1,7 @@
+# caution
+
+Still very inaccurate! Working on method to understand when its filled with dishes to the point that it cant recognize a single dish
+
 # dishwatcher
 
 iot system that watches my kitchen sink with a camera and yells at me when dishes have been sitting there too long.
