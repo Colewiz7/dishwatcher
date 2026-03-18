@@ -15,6 +15,25 @@ import requests
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("dishwatcher.edge")
 
+# -- loader --
+
+def _load_dotenv():
+    envfile = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.isfile(envfile):
+        with open(envfile) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+
+_load_dotenv()
+
+def _env(key, default):
+    return os.environ.get(key, default)
+
 # -- config (env vars override these) --
 
 def _env(key, default):
