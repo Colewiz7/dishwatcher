@@ -1,0 +1,19 @@
+# edit User, WorkingDirectory, ExecStart, and Environment lines before installing
+[Unit]
+Description=dishwatcher edge (pi camera monitor)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/dishwatcher-edge
+ExecStart=/home/YOUR_USERNAME/dishwatcher-edge/venv/bin/python watcher.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/home/YOUR_USERNAME/dishwatcher-edge/.env
+CPUQuota=50%
+OOMPolicy=continue
+
+[Install]
+WantedBy=multi-user.target

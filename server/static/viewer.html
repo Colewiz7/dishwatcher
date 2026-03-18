@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dish Watcher</title>
+<link rel="icon" href="/icon.png" type="image/png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <!-- Top bar -->
+  <div class="topbar">
+    <div class="logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>
+      dish watcher <span>v4</span>
+    </div>
+    <div class="topbar-spacer"></div>
+    <div class="conn-badge" id="connBadge">
+      <div class="conn-dot" id="connDot"></div>
+      <span id="connText">connecting</span>
+    </div>
+    <button class="topbar-btn" id="notifyBtn" onclick="toggleNotifications()" title="Browser notifications">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0112 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 003.4 0"/></svg>
+      notify
+    </button>
+    <button class="topbar-btn" id="soundBtn" onclick="toggleSound()" title="Alert sounds">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 010 7.07"/></svg>
+      sound
+    </button>
+  </div>
+
+  <!-- State hero -->
+  <div class="state-hero">
+    <div class="state-orb CLEAR" id="stateOrb">&#x2713;</div>
+    <div class="state-info">
+      <h1 id="stateTitle">Sink is clear</h1>
+      <p id="stateSub">Waiting for data...</p>
+    </div>
+  </div>
+
+  <!-- Main grid -->
+  <div class="grid">
+
+    <!-- LEFT: Camera feed + gallery -->
+    <div>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Live feed</span>
+          <span class="card-badge" id="feedMode">--</span>
+        </div>
+        <div class="feed-wrap" id="feedWrap">
+          <div class="feed-placeholder" id="feedPlaceholder">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".4"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="3"/><circle cx="18" cy="6" r="1"/></svg>
+            Waiting for first frame
+          </div>
+          <img id="feedImg" style="display:none" onclick="openLightbox(this.src)">
+          <div class="feed-overlay" id="feedOverlay" style="display:none">
+            <span id="feedInference">--</span>
+            <span id="feedTime">--</span>
+          </div>
+        </div>
+        <div class="gallery" id="gallery"></div>
+      </div>
+
+      <!-- Chart -->
+      <div class="card chart-card" style="margin-top:16px">
+        <div class="card-header">
+          <span class="card-title">Detection timeline (24h)</span>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="timelineChart"></canvas>
+        </div>
+      </div>
+
+      <!-- Recent detections -->
+      <div class="card" style="margin-top:16px">
+        <div class="card-header">
+          <span class="card-title">Recent detections</span>
+          <span class="card-badge" id="detCount">0</span>
+        </div>
+        <div class="list-body" id="detList"></div>
+      </div>
+    </div>
+
+    <!-- RIGHT: Status panels -->
+    <div>
+      <!-- Consensus -->
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Consensus buffer</span>
+          <span class="card-badge" id="consensusRatio">0/0</span>
+        </div>
+        <div class="consensus" id="consensusDots"></div>
+        <div class="consensus-bar">
+          <div class="consensus-fill" id="consensusFill" style="width:0;background:var(--green)"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:6px">
+          <span style="font-family:var(--font-mono);font-size:.68rem;color:var(--tx-3)">Confidence</span>
+          <span style="font-family:var(--font-mono);font-size:.68rem;color:var(--tx-2)" id="consensusPct">0%</span>
+        </div>
+      </div>
+
+      <!-- Grace timer -->
+      <div class="card" style="margin-top:16px" id="timerCard">
+        <div class="card-header">
+          <span class="card-title">Grace timer</span>
+          <span class="card-badge" id="timerState">inactive</span>
+        </div>
+        <div class="timer" id="timerDisplay">--:--</div>
+        <div class="timer-sub" id="timerSub">No active timer</div>
+      </div>
+
+      <!-- Stats -->
+      <div class="card" style="margin-top:16px">
+        <div class="card-header">
+          <span class="card-title">Statistics</span>
+        </div>
+        <div class="stats-grid">
+          <div class="stat">
+            <div class="stat-label">Frames today</div>
+            <div class="stat-value" id="statFrames">0</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Dish rate</div>
+            <div class="stat-value" id="statDishRate">0%</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Avg inference</div>
+            <div class="stat-value sm" id="statInference">-- ms</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Total alerts</div>
+            <div class="stat-value" id="statAlerts">0</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Last hour</div>
+            <div class="stat-value sm" id="statHour">0 frames</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Transitions</div>
+            <div class="stat-value" id="statTransitions">0</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- State events -->
+      <div class="card" style="margin-top:16px">
+        <div class="card-header">
+          <span class="card-title">State events</span>
+          <span class="card-badge" id="eventCount">0</span>
+        </div>
+        <div class="list-body" id="eventList"></div>
+      </div>
+
+      <!-- Admin -->
+      <div class="card" style="margin-top:16px">
+        <div class="card-header">
+          <span class="card-title">Admin controls</span>
+        </div>
+        <div class="admin-bar">
+          <button class="admin-btn" onclick="adminAction('/admin/reset-sink','POST')">Reset sink</button>
+          <div class="admin-sep"></div>
+          <button class="admin-btn" onclick="adminAction('/admin/force-state?state=CLEAR','POST')">Force clear</button>
+          <button class="admin-btn" onclick="adminAction('/admin/force-state?state=CONFIRMED','POST')">Force confirmed</button>
+          <button class="admin-btn danger" onclick="adminAction('/admin/force-state?state=ALERTED','POST')">Force alert</button>
+          <div class="admin-sep"></div>
+          <button class="admin-btn" onclick="adminAction('/admin/test-notify','POST')">Test notify</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Toast container -->
+<div class="toast-container" id="toasts"></div>
+
+<!-- Lightbox -->
+<div class="lightbox" id="lightbox" onclick="closeLightbox()">
+  <img id="lightboxImg">
+  <button class="lightbox-close" onclick="closeLightbox()">&times;</button>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

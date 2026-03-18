@@ -1,0 +1,22 @@
+# edit User, WorkingDirectory, and Environment lines before installing
+[Unit]
+Description=dishwatcher server (yolo + dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/dishwatcher-server
+ExecStart=/usr/bin/python3 -m uvicorn server:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+Environment=DISH_API_KEY=changeme
+Environment=YOLO_MODEL_PATH=yolov8n.pt
+Environment=CONFIDENCE_THRESHOLD=0.40
+Environment=IMAGE_SAVE_DIR=/home/YOUR_USERNAME/dishwatcher-server/images
+Environment=CAMERA_ROTATION=180
+Environment=DB_PATH=/home/YOUR_USERNAME/dishwatcher-server/data/dishwatcher.db
+
+[Install]
+WantedBy=multi-user.target
