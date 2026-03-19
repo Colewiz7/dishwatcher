@@ -8,13 +8,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# grab yolo weights at build time so its cached in the layer
+# cache yolo weights in image layer
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 
 COPY server.py detector.py storage.py state_machine.py notifier.py ./
 COPY static/ ./static/
 
-RUN mkdir -p /app/images /app/data
+RUN mkdir -p /app/data /app/data/images /app/data/videos
 
 EXPOSE 8000
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

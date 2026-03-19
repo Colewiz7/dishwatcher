@@ -1,60 +1,96 @@
-# caution
-
-Still very inaccurate! Working on method to understand when its filled with dishes to the point that it cant recognize a single dish
-
 # dishwatcher
 
-iot system that watches my kitchen sink with a camera and yells at me when dishes have been sitting there too long.
+iot system that watches my kitchen sink with a camera and nags me when dishes pile up. also records blame clips so i know who did it.
 
 ```
 dishwatcher/
-├── server/    <- runs on a debian server (yolov8 + dashboard)
-└── camera/    <- runs on a raspberry pi (motion detection + frame posting)
+├── server/    <- debian server (detection + dashboard)
+└── camera/    <- raspberry pi (motion + video capture)
 ```
-
-![dashboard](https://img.shields.io/badge/dashboard-live-22c55e) ![yolov8](https://img.shields.io/badge/yolo-v8n-blue) ![python](https://img.shields.io/badge/python-3.11-yellow)
 
 ## what it does
 
-a usb webcam pointed at the sink feeds frames to a raspberry pi. the pi runs background subtraction to detect motion, then posts the frame to a server over http. the server runs yolov8 to figure out if there are actually dishes in the sink (cups, bowls, forks, spoons, knives). if dishes sit there for 90 minutes, i get an alert.
+a usb webcam on a raspberry pi watches the sink. when someone walks up and leaves, the pi:
 
-the key insight is that single yolo frames are unreliable. one shadow, one weird angle, and you get a false positive. so the server uses a **temporal consensus engine**: it keeps a ring buffer of the last 7 detection results and only changes state when 5 of them agree. this kills false positives and false negatives.
+1. saves a **15 second blame clip** of who was there
+2. waits 10 seconds for them to fully leave
+3. takes a clean photo of the sink (no one blocking the view)
+4. posts both to the server
+
+the server compares the photo against a saved "clean sink" reference image using **SSIM** (structural similarity). if the sink looks different from clean, there are dishes. way more reliable than yolo alone because SSIM catches everything: pots, pans, cutting boards, random shit piled up. not just the 5 coco classes yolo knows.
+
+if dishes sit there for 90 minutes, you get an alert. the blame clip tells you who put them there.
 
 ## architecture
 
 ```
-┌─────────────────┐         HTTP POST /upload         ┌──────────────────────────┐
-│  raspberry pi   │ ─────────────────────────────────► │  server                  │
-│                 │     jpeg frame + mode header       │                          │
-│  watcher.py     │                                    │  server.py  (fastapi)    │
-│  - usb webcam   │                                    │  detector.py (yolov8)    │
-│  - mog2 motion  │ ◄──────────────────────────────── │  state_machine.py        │
-│  - heartbeat    │     json: state, consensus,        │  storage.py              │
-│    mode         │     detections, grace timer         │  notifier.py (discord)   │
-└─────────────────┘                                    │                          │
-                                                       │  GET / ──► viewer.html   │
-                                                       │  GET /stream ──► SSE     │
-                                                       └──────────────────────────┘
-                                                                │
-                                                       browser connects to :8000
-                                                       real-time dashboard via sse
+┌─────────────────────┐                          ┌──────────────────────────┐
+│  raspberry pi       │   POST frame + video     │  server                  │
+│                     │ ────────────────────────► │                          │
+│  1. motion detected │                          │  1. ssim vs reference    │
+│  2. record 15s clip │                          │     "is sink different   │
+│  3. wait 10s        │ ◄──────────────────────── │      from clean?"       │
+│  4. capture + send  │   json: state, ssim,     │  2. yolo labels (opt)   │
+│                     │   consensus              │  3. state machine       │
+│  5. heartbeat mode  │                          │  4. dashboard + alerts  │
+└─────────────────────┘                          └──────────────────────────┘
 ```
 
-designed for networks with client isolation (like university wifi) where the server cant reach the pi. all communication is pi-initiated http.
+## detection: how it actually works
+
+**old approach (v4):** yolo looks for cups/forks/bowls. misses pots, pans, cutting boards, and anything that isnt in its training data. also the sink roi was tiny.
+
+**new approach (v5):** take a photo of your clean sink, save it as a reference. every new frame gets compared using SSIM on just the sink region. SSIM asks "do these two images look the same?" not "can i find a fork?" this catches everything.
+
+yolo still runs optionally as a secondary pass to label what it sees (so the dashboard can say "2 bowls, 1 pot" instead of just "dirty"). but the primary dirty/clean decision is SSIM.
+
+the reference frame gets histogram-equalized before comparison so lighting changes (daylight vs kitchen light) dont cause false positives.
+
+### setup flow
+
+1. deploy server, open dashboard
+2. clean your sink
+3. hit "set reference" on the dashboard (saves the clean photo)
+4. the server auto-detects the sink bounding box with yolo
+5. done, system is calibrated
+
+if you move the camera, just set a new reference.
+
+## blame clips
+
+when someone walks up to the sink:
+- the pi starts recording frames into a ring buffer (15 sec at 5fps)
+- when they walk away, the pi waits 10 seconds (capture delay)
+- then it encodes the buffer as an mp4 and sends it with the detection frame
+- the server saves the clip and shows it in the dashboard
+
+you can scrub through blame clips on the dashboard to see who left dishes.
+
+## counter detection (optional)
+
+toggle in the dashboard. defines a second ROI for the counter area next to the sink. uses the same SSIM approach. items on the counter (drying rack, etc) show up in the dashboard but dont trigger alerts.
+
+## state machine
+
+```
+CLEAR ──(5/7 frames say dirty)──► CONFIRMED ──(90 min timer)──► ALERTED
+  ▲                                      │                           │
+  └──────(5/7 frames say clean)──────────┘───────────────────────────┘
+```
+
+same consensus engine as before. 5 out of 7 frames need to agree before changing state. sqlite-backed, full history.
 
 ## quick start
 
-### server (your linux box / homelab)
+### server
 
 ```bash
 git clone https://github.com/Colewiz7/dishwatcher
 cd dishwatcher/server
-# edit docker-compose.yml (at minimum set DISH_API_KEY)
+# edit docker-compose.yml
 docker compose up -d
 # dashboard at http://your-server-ip:8000
 ```
-
-or bare metal: `pip install -r requirements.txt && uvicorn server:app --host 0.0.0.0 --port 8000`
 
 ### camera (raspberry pi)
 
@@ -62,126 +98,68 @@ or bare metal: `pip install -r requirements.txt && uvicorn server:app --host 0.0
 git clone https://github.com/Colewiz7/dishwatcher
 cd dishwatcher/camera
 chmod +x setup.sh
-./setup.sh         # auto-detects python, makes venv, installs deps
-nano .env          # set DISH_SERVER_URL to your server
+./setup.sh         # handles python, venv, deps, asks for server hostname
 venv/bin/python watcher.py
 ```
 
-both sides include systemd service files for auto-start on boot. see the READMEs in each folder for full details.
+### first time calibration
 
-## how detection works
-
-**dual-pass yolo inference:**
-
-1. **pass 1**: run yolov8n on the full 640x480 frame. this finds the sink (coco class 71), bowls, cups, and other larger objects. on first detection, the sink bounding box gets cached to disk so we dont need to re-find it every frame.
-
-2. **pass 2**: crop just the sink region, upscale it to 640px wide, and run yolo again. forks, spoons, and knives are often only ~20px in a full frame, which is below yolo's effective detection threshold. the upscaled crop makes them 3-4x larger and way easier to catch.
-
-detections from both passes get merged, deduplicated by iou, and filtered so only objects whose center point is inside the cached sink bounding box count. a bowl on the counter doesnt trigger anything.
-
-## state machine
-
-```
-CLEAR ──(5/7 frames say dishes)──► CONFIRMED ──(90 min timer)──► ALERTED
-  ▲                                      │                           │
-  └──────(5/7 frames say clear)──────────┘───────────────────────────┘
-```
-
-- **CLEAR**: sink is empty, system is idle
-- **CONFIRMED**: consensus agrees dishes are present, grace timer starts
-- **ALERTED**: timer expired, notification fired. stays here until dishes are cleared
-
-every state transition requires 5 out of 7 frames to agree. one yolo hallucination doesnt do shit.
-
-all state, detections, and transitions get logged to sqlite so the dashboard can show history and stats.
-
-## the dashboard
-
-real-time web ui served at the server root. no separate frontend deploy, its just static files served by fastapi.
-
-- **sse connection** (server-sent events, not polling) so updates are instant
-- **live camera feed** that updates on every frame the pi sends
-- **consensus buffer visualization** showing the ring buffer state
-- **grace timer countdown** that ticks every second
-- **24hr detection timeline chart** (chart.js)
-- **detection log + state event log** that update in real time
-- **browser notifications** (with image attachment) and **audio alerts**
-- **admin controls**: reset sink cache, force state, test notifications
-- **stats panel**: frames today, dish rate, avg inference, total alerts
-
-dark theme, monospace data, teal accents. looks like a monitoring dashboard, not a webapp.
-
-## heartbeat mode
-
-the biggest problem with earlier versions was that once someone places dishes and walks away, motion stops, and the pi stops sending frames. the dishes become invisible to the system.
-
-fix: after any motion is detected, the pi enters "monitoring mode" and sends a heartbeat frame every 30 seconds even without motion. it exits monitoring when the server confirms the sink has been clear for 3 consecutive heartbeats. if the server state is CONFIRMED or ALERTED, monitoring stays active indefinitely.
-
-## pi optimizations
-
-the pi is slow. the old code pegged it at 100% cpu doing basically nothing. current version:
-
-- motion detection runs on **grayscale** (3x less data through mog2)
-- motion frame is **downscaled to 320x240** (75% fewer pixels to process)
-- only process **every 3rd frame** for motion (configurable)
-- **sleep when idle** instead of busy-looping on cap.read()
-- **connection pooling** (reuse tcp session instead of handshake per post)
-
-idle cpu: ~2-5% (was ~100%).
-
-## tech stack
-
-| component | tech |
-|-----------|------|
-| edge motion detection | opencv mog2 (background subtraction) |
-| object detection | yolov8n (coco pretrained) |
-| server framework | fastapi + uvicorn |
-| real-time updates | server-sent events |
-| state persistence | sqlite (wal mode) |
-| image annotation | pillow |
-| dashboard | vanilla html/css/js + chart.js |
-| notifications | discord webhooks, browser notifications, web audio |
-| deployment | docker, systemd |
+1. open the dashboard in a browser
+2. make sure the camera can see the sink
+3. clean the sink
+4. click "set reference" on the dashboard
+5. system is ready
 
 ## repo structure
 
 ```
 dishwatcher/
-├── README.md                  <- you are here
+├── README.md
 ├── .gitignore
-│
 ├── server/
-│   ├── server.py              <- fastapi app, routes, sse
-│   ├── detector.py            <- yolov8 dual-pass inference
+│   ├── server.py              <- fastapi, routes, sse
+│   ├── detector.py            <- ssim comparison + optional yolo
 │   ├── state_machine.py       <- consensus engine + sqlite
-│   ├── storage.py             <- threaded image saves
-│   ├── notifier.py            <- discord webhooks (optional)
+│   ├── storage.py             <- image + video saves
+│   ├── notifier.py            <- discord webhooks
 │   ├── static/
-│   │   ├── viewer.html        <- dashboard markup
-│   │   ├── style.css          <- dashboard styles
-│   │   └── app.js             <- dashboard logic + sse client
+│   │   ├── viewer.html
+│   │   ├── style.css
+│   │   └── app.js
 │   ├── systemd/
 │   │   └── dishwatcher-server.service
 │   ├── Dockerfile
 │   ├── docker-compose.yml
-│   ├── requirements.txt
-│   └── README.md
-│
+│   └── requirements.txt
 └── camera/
-    ├── watcher.py             <- motion detection + heartbeat
-    ├── setup.sh               <- auto python/venv/deps setup
+    ├── watcher.py             <- motion + video buffer + delayed capture
+    ├── setup.sh               <- interactive setup script
     ├── .env.example
     ├── systemd/
     │   └── dishwatcher-edge.service
-    ├── requirements.txt
-    └── README.md
+    └── requirements.txt
 ```
+
+## tech stack
+
+| component | tech |
+|-----------|------|
+| primary detection | SSIM (structural similarity) |
+| secondary labeling | yolov8n (optional) |
+| edge motion | opencv mog2 |
+| blame clips | opencv VideoWriter (mp4) |
+| server | fastapi + uvicorn |
+| real-time updates | server-sent events |
+| state persistence | sqlite (wal mode) |
+| dashboard | vanilla html/css/js + chart.js |
+| notifications | discord, browser notifications, web audio |
+| deployment | docker, systemd |
 
 ## future stuff
 
-- [ ] fine-tune yolov8n on actual sink images (even 50 labeled frames would help)
-- [ ] ntfy.sh as a notification channel (lighter than discord)
-- [ ] "snooze" button on the dashboard to delay alerts
-- [ ] image retention policy (auto-delete frames older than N days)
+- [ ] dashboard rewrite (mobile-first, video gallery with playback, swipeable history)
+- [ ] visual ROI editor on dashboard (drag to set sink/counter regions)
+- [ ] fine-tune yolo on actual sink images
+- [ ] ntfy.sh notifications
+- [ ] auto image/video cleanup (delete old files after N days)
 - [ ] multi-camera support
-- [ ] grafana integration for long-term metrics

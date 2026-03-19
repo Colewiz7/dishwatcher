@@ -1,6 +1,11 @@
-# detector.py - yolov8 inference + sink roi filtering
-# runs dual pass: full frame first, then cropped sink region upscaled
-# to catch small stuff (forks/spoons are like 20px in a full frame lol)
+# detector.py - v5 detection engine
+# primary detection: compare current frame against a "clean" reference using SSIM
+# secondary (optional): run yolo to label what's actually there
+# counter detection (optional): separate ROI for counter area
+#
+# way more reliable than yolo-only because SSIM catches everything:
+# pots, pans, cutting boards, random shit piled up. yolo only knows
+# specific coco classes. SSIM just asks "does this look different from clean?"
 
 import json
 import logging
@@ -11,281 +16,352 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-from ultralytics import YOLO
 
 log = logging.getLogger("dishwatcher.detector")
 
-# coco class ids we care about
-SINK_CLASS_ID = 71
-DISH_CLASS_IDS = {41: "cup", 42: "fork", 43: "knife", 44: "spoon", 45: "bowl"}
-ALL_KITCHENWARE = {**DISH_CLASS_IDS, SINK_CLASS_ID: "sink"}
-YOLO_CLASSES = list(ALL_KITCHENWARE.keys())  # pass to model() so it skips the other 74 classes
+# -- config --
+YOLO_ENABLED     = os.environ.get("YOLO_ENABLED", "true").lower() == "true"
+SSIM_THRESHOLD   = float(os.environ.get("SSIM_THRESHOLD", "0.82"))
+COUNTER_ENABLED  = os.environ.get("COUNTER_ENABLED", "false").lower() == "true"
+COUNTER_SSIM     = float(os.environ.get("COUNTER_SSIM_THRESHOLD", "0.80"))
 
-# dual pass config
-DUAL_PASS  = os.environ.get("DUAL_PASS_ENABLED", "true").lower() == "true"
-DUAL_PAD   = int(os.environ.get("DUAL_PASS_PADDING", "40"))
-DUAL_MIN_W = int(os.environ.get("DUAL_PASS_MIN_WIDTH", "200"))
-IOU_THRESH = float(os.environ.get("IOU_DEDUP_THRESHOLD", "0.4"))
+# paths
+_DATA_DIR    = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent)))
+_REF_PATH    = _DATA_DIR / "reference.jpg"
+_ROI_PATH    = _DATA_DIR / "roi.json"
+_MODEL_PATH  = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
+_CONFIDENCE  = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.40"))
 
-# annotation colors (rgb for pillow)
-CLR_DISH = (34, 197, 94)
-CLR_TEXT = (0, 0, 0)
-STATE_COLORS = {
-    "CLEAR": (34, 197, 94), "DETECTED": (234, 179, 8),
-    "CONFIRMED": (249, 115, 22), "ALERTED": (239, 68, 68),
-}
+# coco classes for yolo labeling
+DISH_CLASSES = {41: "cup", 42: "fork", 43: "knife", 44: "spoon", 45: "bowl"}
+SINK_CLASS   = 71
+ALL_CLASSES  = {**DISH_CLASSES, SINK_CLASS: "sink"}
+YOLO_CLASS_IDS = list(ALL_CLASSES.keys())
 
-# font stuff
-_FONT_PATHS = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-]
+# annotation colors (rgb for pillow, bgr for opencv)
+CLR_DIRTY  = (0, 0, 255)     # red
+CLR_CLEAN  = (0, 200, 0)     # green
+CLR_SINK   = (246, 130, 59)  # blue
+CLR_COUNTER = (255, 165, 0)  # orange
 
-def _load_font(size=15):
-    for p in _FONT_PATHS:
-        if os.path.exists(p):
-            return ImageFont.truetype(p, size)
-    log.warning("no ttf font found, using default")
-    return ImageFont.load_default()
+# font
+FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-FONT = _load_font(15)
-
-# sink bbox gets cached to disk so we dont need to re-detect it every frame
-_CACHE_PATH = Path(__file__).parent / "sink_location.json"
-_sink_bbox = None
+# state
 _model = None
+_reference = None  # the "clean sink" reference image
+_roi = None        # {"sink": [x1,y1,x2,y2], "counter": [x1,y1,x2,y2] (optional)}
 
 
-def load_model(path):
-    global _model
-    log.info("loading yolo: %s", path)
-    _model = YOLO(path)
+# -- ssim implementation --
+# no extra deps needed, just numpy + opencv
 
-    # warmup with a dummy frame so the first real one isnt slow
-    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-    _model(dummy, verbose=False, classes=YOLO_CLASSES)
-    log.info("model ready (warmed up). dual pass: %s", DUAL_PASS)
+def compute_ssim(img1, img2):
+    """structural similarity between two grayscale images. returns 0-1 (1=identical)"""
+    C1 = (0.01 * 255) ** 2
+    C2 = (0.03 * 255) ** 2
 
-    _load_sink_cache()
+    i1 = img1.astype(np.float64)
+    i2 = img2.astype(np.float64)
+
+    mu1 = cv2.GaussianBlur(i1, (11, 11), 1.5)
+    mu2 = cv2.GaussianBlur(i2, (11, 11), 1.5)
+
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+
+    sig1_sq = cv2.GaussianBlur(i1 ** 2, (11, 11), 1.5) - mu1_sq
+    sig2_sq = cv2.GaussianBlur(i2 ** 2, (11, 11), 1.5) - mu2_sq
+    sig12   = cv2.GaussianBlur(i1 * i2, (11, 11), 1.5) - mu1_mu2
+
+    num = (2 * mu1_mu2 + C1) * (2 * sig12 + C2)
+    den = (mu1_sq + mu2_sq + C1) * (sig1_sq + sig2_sq + C2)
+
+    ssim_map = num / den
+    return float(ssim_map.mean())
 
 
-def get_model():
-    if _model is None:
-        raise RuntimeError("model not loaded, call load_model() first")
-    return _model
+def _prep_for_ssim(img):
+    """grayscale + histogram equalize to handle lighting changes"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+    return cv2.equalizeHist(gray)
 
 
-# -- sink cache --
-# saves the sink bounding box to json so we dont lose it on restart.
-# if you move the camera, hit POST /admin/reset-sink
+def _crop_roi(img, roi):
+    """crop image to roi [x1, y1, x2, y2]"""
+    x1, y1, x2, y2 = roi
+    h, w = img.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    return img[y1:y2, x1:x2]
 
-def _load_sink_cache():
-    global _sink_bbox
-    if _CACHE_PATH.exists():
+
+# -- reference frame --
+
+def load_reference():
+    global _reference
+    if _REF_PATH.exists():
+        _reference = cv2.imread(str(_REF_PATH))
+        if _reference is not None:
+            log.info("loaded reference image: %s", _REF_PATH)
+        else:
+            log.warning("reference file exists but couldnt read it")
+    else:
+        log.info("no reference image yet, set one via dashboard")
+
+
+def save_reference(frame):
+    """save a frame as the clean reference"""
+    global _reference
+    os.makedirs(str(_DATA_DIR), exist_ok=True)
+    cv2.imwrite(str(_REF_PATH), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    _reference = frame.copy()
+    log.info("reference saved: %s", _REF_PATH)
+
+
+def get_reference():
+    return _reference
+
+
+def has_reference():
+    return _reference is not None
+
+
+# -- roi --
+
+def load_roi():
+    global _roi
+    if _ROI_PATH.exists():
         try:
-            _sink_bbox = json.loads(_CACHE_PATH.read_text())["bbox"]
-            log.info("loaded sink cache: %s", _sink_bbox)
+            _roi = json.loads(_ROI_PATH.read_text())
+            log.info("loaded roi: %s", _roi)
         except Exception as e:
-            log.warning("bad sink cache: %s", e)
-
-def _save_sink_cache(bbox):
-    try:
-        _CACHE_PATH.write_text(json.dumps({"bbox": bbox}, indent=2))
-    except Exception as e:
-        log.warning("couldnt save sink cache: %s", e)
-
-def reset_sink_cache():
-    global _sink_bbox
-    _sink_bbox = None
-    if _CACHE_PATH.exists():
-        _CACHE_PATH.unlink()
-    log.info("sink cache cleared")
-
-def get_sink_status():
-    return {"cached": _sink_bbox is not None, "bbox": _sink_bbox,
-            "cache_file": str(_CACHE_PATH)}
+            log.warning("bad roi file: %s", e)
 
 
-# -- geometry helpers --
-
-def _centre_in(dbox, sbox):
-    """check if center of dish bbox is inside sink bbox"""
-    cx = (dbox[0] + dbox[2]) * 0.5
-    cy = (dbox[1] + dbox[3]) * 0.5
-    return sbox[0] <= cx <= sbox[2] and sbox[1] <= cy <= sbox[3]
-
-def _iou(a, b):
-    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
-    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-    union = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
-    return inter / union if union > 0 else 0.0
-
-def _dedup(dets, thresh):
-    """remove overlapping detections of same class, keep higher confidence"""
-    if len(dets) <= 1:
-        return dets
-    dets = sorted(dets, key=lambda d: d["confidence"], reverse=True)
-    keep = []
-    for d in dets:
-        if not any(d["class_id"] == k["class_id"] and _iou(d["bbox"], k["bbox"]) >= thresh
-                   for k in keep):
-            keep.append(d)
-    return keep
+def save_roi(roi_data):
+    """save roi. expects {"sink": [x1,y1,x2,y2], "counter": [x1,y1,x2,y2] (optional)}"""
+    global _roi
+    os.makedirs(str(_DATA_DIR), exist_ok=True)
+    _ROI_PATH.write_text(json.dumps(roi_data, indent=2))
+    _roi = roi_data
+    log.info("roi saved: %s", _roi)
 
 
-# -- extract detections from yolo results --
+def get_roi():
+    return _roi
 
-def _extract(results, conf_thresh, ox=0, oy=0):
-    """pull detections out of yolo results as dicts. ox/oy offset for crop remapping."""
-    dishes, sinks = [], []
+
+def auto_detect_sink(frame):
+    """use yolo to find the sink bbox. returns [x1,y1,x2,y2] or None"""
+    if _model is None:
+        return None
+
+    results = _model(frame, verbose=False, classes=[SINK_CLASS])
+    for r in results:
+        if r.boxes is None or len(r.boxes) == 0:
+            continue
+        # pick highest confidence sink
+        confs = r.boxes.conf.cpu().numpy()
+        best = confs.argmax()
+        bbox = r.boxes.xyxy[best].cpu().numpy().astype(int).tolist()
+        log.info("auto-detected sink: %s (conf %.0f%%)", bbox, confs[best] * 100)
+        return bbox
+
+    return None
+
+
+# -- yolo (secondary, for labeling) --
+
+def load_model(path=None):
+    global _model
+    path = path or _MODEL_PATH
+    if YOLO_ENABLED:
+        log.info("loading yolo: %s", path)
+        from ultralytics import YOLO
+        _model = YOLO(path)
+        # warmup
+        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+        _model(dummy, verbose=False, classes=YOLO_CLASS_IDS)
+        log.info("yolo ready")
+    else:
+        log.info("yolo disabled")
+
+    load_reference()
+    load_roi()
+
+
+def _run_yolo(frame):
+    """run yolo and return list of detection dicts"""
+    if _model is None:
+        return []
+
+    results = _model(frame, verbose=False, classes=YOLO_CLASS_IDS)
+    dets = []
 
     for r in results:
         if r.boxes is None or len(r.boxes) == 0:
             continue
-
-        # batch numpy extraction, way faster than per-box .item() calls
         xyxy = r.boxes.xyxy.cpu().numpy().astype(int)
         confs = r.boxes.conf.cpu().numpy()
         clss = r.boxes.cls.cpu().numpy().astype(int)
 
         for i in range(len(clss)):
             cid = clss[i]
-            conf = float(confs[i])
-            if conf < conf_thresh or cid not in ALL_KITCHENWARE:
+            if cid == SINK_CLASS or cid not in ALL_CLASSES:
                 continue
+            if confs[i] < _CONFIDENCE:
+                continue
+            dets.append({
+                "label": ALL_CLASSES[cid],
+                "class_id": int(cid),
+                "confidence": round(float(confs[i]), 4),
+                "bbox": xyxy[i].tolist(),
+            })
 
-            bbox = [int(xyxy[i][0]) + ox, int(xyxy[i][1]) + oy,
-                    int(xyxy[i][2]) + ox, int(xyxy[i][3]) + oy]
-            entry = {"label": ALL_KITCHENWARE[cid], "class_id": cid,
-                     "confidence": round(conf, 4), "bbox": bbox}
-            (sinks if cid == SINK_CLASS_ID else dishes).append(entry)
-
-    return dishes, sinks
+    return dets
 
 
-# -- inference --
+# -- main detection --
 
-def run_inference(frame, conf_thresh):
+def detect(frame):
     """
-    dual pass yolo inference.
-    pass 1: full frame (finds sink, bowls, cups)
-    pass 2: cropped sink region upscaled to 640px (catches forks, spoons, knives)
-    returns (detections, total_ms, meta)
+    main detection function. returns dict with:
+        dishes_found, ssim_score, labels, detections,
+        counter_dirty, counter_ssim (if enabled),
+        has_reference, has_roi, inference_ms
     """
-    global _sink_bbox
-    model = get_model()
-    h, w = frame.shape[:2]
-
-    # pass 1: full frame
     t0 = time.perf_counter()
-    res1 = model(frame, verbose=False, classes=YOLO_CLASSES)
-    t1 = time.perf_counter()
-    p1_ms = (t1 - t0) * 1000
-
-    dishes1, sinks1 = _extract(res1, conf_thresh)
-
-    # learn sink location on first detection
-    sink_new = False
-    if _sink_bbox is None and sinks1:
-        best = max(sinks1, key=lambda s: s["confidence"])
-        _sink_bbox = best["bbox"]
-        _save_sink_cache(_sink_bbox)
-        sink_new = True
-        log.info("sink learned: %s (%.0f%%)", _sink_bbox, best["confidence"] * 100)
-
-    # pass 2: cropped sink region, upscaled so small objects are actually visible
-    dishes2 = []
-    p2_ms = 0.0
-
-    if DUAL_PASS and _sink_bbox is not None:
-        sx1, sy1, sx2, sy2 = _sink_bbox
-        cx1, cy1 = max(0, sx1 - DUAL_PAD), max(0, sy1 - DUAL_PAD)
-        cx2, cy2 = min(w, sx2 + DUAL_PAD), min(h, sy2 + DUAL_PAD)
-        cw = cx2 - cx1
-
-        if cw >= DUAL_MIN_W:
-            crop = frame[cy1:cy2, cx1:cx2]
-            scale = 640.0 / cw
-            up = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-
-            t2 = time.perf_counter()
-            res2 = model(up, verbose=False, classes=YOLO_CLASSES)
-            t3 = time.perf_counter()
-            p2_ms = (t3 - t2) * 1000
-
-            raw2, _ = _extract(res2, conf_thresh)
-
-            # map upscaled coords back to full frame coords
-            inv = 1.0 / scale
-            for d in raw2:
-                bx1, by1, bx2, by2 = d["bbox"]
-                d["bbox"] = [int(bx1 * inv) + cx1, int(by1 * inv) + cy1,
-                             int(bx2 * inv) + cx1, int(by2 * inv) + cy1]
-            dishes2 = raw2
-
-    total_ms = round(p1_ms + p2_ms, 2)
-
-    # merge both passes, dedup overlaps, only keep stuff inside the sink
-    merged = _dedup(dishes1 + dishes2, IOU_THRESH)
-
-    if _sink_bbox is None:
-        filtered = []
-    else:
-        filtered = [d for d in merged if _centre_in(d["bbox"], _sink_bbox)]
-
-    meta = {
-        "sink_bbox": _sink_bbox, "sink_newly_found": sink_new,
-        "sink_cached": _sink_bbox is not None,
-        "pass1_ms": round(p1_ms, 2), "pass2_ms": round(p2_ms, 2),
-        "pass2_detections": len(dishes2),
+    result = {
+        "dishes_found": False,
+        "ssim_score": 1.0,
+        "labels": [],
+        "detections": [],
+        "counter_dirty": False,
+        "counter_ssim": 1.0,
+        "has_reference": has_reference(),
+        "has_roi": _roi is not None and "sink" in (_roi or {}),
     }
-    return filtered, total_ms, meta
+
+    # -- ssim comparison against reference --
+    if _reference is not None and _roi and "sink" in _roi:
+        ref_crop = _crop_roi(_reference, _roi["sink"])
+        cur_crop = _crop_roi(frame, _roi["sink"])
+
+        # make sure they're the same size (in case frame size changed)
+        if ref_crop.shape != cur_crop.shape:
+            cur_crop = cv2.resize(cur_crop, (ref_crop.shape[1], ref_crop.shape[0]))
+
+        ref_gray = _prep_for_ssim(ref_crop)
+        cur_gray = _prep_for_ssim(cur_crop)
+
+        score = compute_ssim(ref_gray, cur_gray)
+        result["ssim_score"] = round(score, 4)
+        result["dishes_found"] = score < SSIM_THRESHOLD
+
+        log.debug("ssim: %.4f (threshold: %.2f) -> %s",
+                  score, SSIM_THRESHOLD,
+                  "DIRTY" if result["dishes_found"] else "CLEAN")
+
+    elif _reference is None:
+        # no reference yet, cant compare. fall back to yolo-only
+        log.debug("no reference image, using yolo only")
+
+    # -- counter detection (optional) --
+    if COUNTER_ENABLED and _reference is not None and _roi and "counter" in _roi:
+        ref_crop = _crop_roi(_reference, _roi["counter"])
+        cur_crop = _crop_roi(frame, _roi["counter"])
+
+        if ref_crop.shape != cur_crop.shape:
+            cur_crop = cv2.resize(cur_crop, (ref_crop.shape[1], ref_crop.shape[0]))
+
+        ref_gray = _prep_for_ssim(ref_crop)
+        cur_gray = _prep_for_ssim(cur_crop)
+
+        counter_score = compute_ssim(ref_gray, cur_gray)
+        result["counter_ssim"] = round(counter_score, 4)
+        result["counter_dirty"] = counter_score < COUNTER_SSIM
+
+    # -- yolo labeling (secondary) --
+    if YOLO_ENABLED and _model is not None:
+        dets = _run_yolo(frame)
+
+        # filter to sink roi if we have one
+        if _roi and "sink" in _roi:
+            sink_box = _roi["sink"]
+            in_sink = []
+            for d in dets:
+                cx = (d["bbox"][0] + d["bbox"][2]) / 2
+                cy = (d["bbox"][1] + d["bbox"][3]) / 2
+                if sink_box[0] <= cx <= sink_box[2] and sink_box[1] <= cy <= sink_box[3]:
+                    d["location"] = "sink"
+                    in_sink.append(d)
+                elif COUNTER_ENABLED and _roi and "counter" in _roi:
+                    cbox = _roi["counter"]
+                    if cbox[0] <= cx <= cbox[2] and cbox[1] <= cy <= cbox[3]:
+                        d["location"] = "counter"
+                        in_sink.append(d)
+            dets = in_sink
+
+        result["detections"] = dets
+        result["labels"] = [d["label"] for d in dets]
+
+        # if no reference, use yolo as primary detection
+        if not has_reference():
+            result["dishes_found"] = len([d for d in dets
+                                           if d.get("location") != "counter"]) > 0
+
+    result["inference_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+    return result
 
 
 # -- annotation --
-# draws bounding boxes + labels on the frame using pillow (crisp text)
 
-def annotate_frame(frame, detections, sink_bbox=None, state_label=""):
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img = Image.fromarray(rgb)
-    draw = ImageDraw.Draw(img, "RGBA")
+def annotate_frame(frame, result, state_label=""):
+    """draw detection info on the frame"""
+    out = frame.copy()
+    h, w = out.shape[:2]
 
-    # sink roi overlay
-    if sink_bbox:
-        sx1, sy1, sx2, sy2 = sink_bbox
-        draw.rectangle([sx1, sy1, sx2, sy2],
-                       fill=(59, 130, 246, 25), outline=(59, 130, 246, 180), width=2)
-        lbl = "SINK ZONE"
-        bb = draw.textbbox((0, 0), lbl, font=FONT)
-        lw, lh = bb[2] - bb[0], bb[3] - bb[1]
-        draw.text((sx1 + (sx2 - sx1 - lw) // 2, sy2 - lh - 6),
-                  lbl, fill=(59, 130, 246, 160), font=FONT)
+    # sink roi
+    if _roi and "sink" in _roi:
+        x1, y1, x2, y2 = _roi["sink"]
+        color = CLR_DIRTY if result["dishes_found"] else CLR_CLEAN
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
 
-    # dish bounding boxes
-    for det in detections:
-        x1, y1, x2, y2 = det["bbox"]
-        label = f"{det['label']}  {det['confidence']:.0%}"
-        draw.rectangle([x1, y1, x2, y2], outline=CLR_DISH + (255,), width=2)
+        # ssim score label
+        ssim_txt = f"SSIM: {result['ssim_score']:.3f}"
+        cv2.putText(out, ssim_txt, (x1 + 4, y2 - 8), FONT, 0.5, color, 1)
 
-        bb = draw.textbbox((0, 0), label, font=FONT)
-        tw, th = bb[2] - bb[0], bb[3] - bb[1]
-        pad = 5
-        ly = y1 - th - pad * 2
-        if ly < 0:
-            ly = y2  # label below box if theres no room above
-        draw.rectangle([x1, ly, x1 + tw + pad * 2, ly + th + pad * 2],
-                       fill=CLR_DISH + (255,))
-        draw.text((x1 + pad, ly + pad // 2), label, fill=CLR_TEXT, font=FONT)
+        # "SINK" label
+        cv2.putText(out, "SINK", (x1 + 4, y1 + 16), FONT, 0.5, CLR_SINK, 1)
 
-    # state overlay top left corner
+    # counter roi (if enabled)
+    if COUNTER_ENABLED and _roi and "counter" in _roi:
+        cx1, cy1, cx2, cy2 = _roi["counter"]
+        ccolor = CLR_COUNTER if result.get("counter_dirty") else CLR_CLEAN
+        cv2.rectangle(out, (cx1, cy1), (cx2, cy2), ccolor, 2)
+        cv2.putText(out, "COUNTER", (cx1 + 4, cy1 + 16), FONT, 0.5, CLR_COUNTER, 1)
+        ctxt = f"SSIM: {result.get('counter_ssim', 0):.3f}"
+        cv2.putText(out, ctxt, (cx1 + 4, cy2 - 8), FONT, 0.5, ccolor, 1)
+
+    # yolo detections
+    for det in result.get("detections", []):
+        bx1, by1, bx2, by2 = det["bbox"]
+        label = f"{det['label']} {det['confidence']:.0%}"
+        cv2.rectangle(out, (bx1, by1), (bx2, by2), (0, 200, 0), 2)
+        cv2.putText(out, label, (bx1, by1 - 6), FONT, 0.45, (0, 200, 0), 1)
+
+    # state label (top left)
     if state_label:
-        color = STATE_COLORS.get(state_label.split()[0], (148, 163, 184))
-        bb = draw.textbbox((0, 0), state_label, font=FONT)
-        sw, sh = bb[2] - bb[0], bb[3] - bb[1]
-        draw.rectangle([8, 8, 18 + sw + 8, 16 + sh], fill=color + (220,))
-        draw.text((14, 10), state_label, fill=(255, 255, 255), font=FONT)
+        # background bar
+        cv2.rectangle(out, (0, 0), (w, 28), (0, 0, 0), -1)
+        status = "DIRTY" if result["dishes_found"] else "CLEAN"
+        color = CLR_DIRTY if result["dishes_found"] else CLR_CLEAN
+        txt = f"{state_label} | {status} | SSIM {result['ssim_score']:.3f}"
+        if not result.get("has_reference"):
+            txt = f"{state_label} | NO REFERENCE SET"
+            color = (0, 165, 255)
+        cv2.putText(out, txt, (6, 20), FONT, 0.55, color, 1)
 
-    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    return out

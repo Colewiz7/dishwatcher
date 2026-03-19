@@ -6,26 +6,29 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./images:/app/images
       - ./data:/app/data
       - ./static:/app/static
     environment:
       - DISH_API_KEY=changeme
+      - SAVE_DIR=/app/data
+      - CAMERA_ROTATION=180
+      # ssim detection
+      - SSIM_THRESHOLD=0.82
+      - YOLO_ENABLED=true
       - YOLO_MODEL_PATH=/app/yolov8n.pt
       - CONFIDENCE_THRESHOLD=0.40
-      - IMAGE_SAVE_DIR=/app/images
-      - CAMERA_ROTATION=180
+      # counter detection (set to true + define counter roi via dashboard)
+      - COUNTER_ENABLED=false
+      # state machine
       - CONSENSUS_WINDOW=7
       - CONSENSUS_THRESHOLD=5
       - GRACE_MINUTES=90
       - DB_PATH=/app/data/dishwatcher.db
-      - DUAL_PASS_ENABLED=true
-      # discord alerts (optional, fill in to enable)
+      # discord (optional)
       # - DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
       # - DISCORD_MENTION=<@your_user_id>
-      # - NOTIFY_COOLDOWN_MIN=30
 
-    # reverse proxy labels (uncomment + edit for your domain)
+    # reverse proxy (uncomment + edit for your domain)
     # labels:
     #   - "traefik.enable=true"
     #   - "traefik.http.routers.dishwatcher.rule=Host(`dishes.yourdomain.com`)"

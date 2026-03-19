@@ -1,6 +1,8 @@
-# dishwatcher-edge
+# dishwatcher camera
 
-lightweight motion detector that runs on a raspberry pi. watches the sink with a usb webcam, and when something moves it posts the frame to the server for yolo inference. also has a heartbeat mode so it keeps checking even after motion stops (catches dishes that are just sitting there).
+raspberry pi edge node. watches the sink, records blame clips, sends detection frames to the server after the person leaves.
+
+see the [root README](../README.md) for the full system overview.
 
 ## setup
 
@@ -8,104 +10,42 @@ lightweight motion detector that runs on a raspberry pi. watches the sink with a
 cd camera/
 chmod +x setup.sh
 ./setup.sh
+# asks for server hostname + api key, tests connection
 ```
 
-the setup script will:
-- find a compatible python version (3.9-3.12, avoids 3.13 numpy issues)
-- create a venv and install deps
-- copy `.env.example` to `.env` for you to edit
-
-then edit `.env` and set `DISH_SERVER_URL` to your server address:
-
-```bash
-nano .env
-```
-
-run it:
-
-```bash
-source venv/bin/activate
-python watcher.py
-```
-
-or without activating the venv:
-
-```bash
-venv/bin/python watcher.py
-```
-
-### auto-start with systemd
-
-```bash
-# edit the service file first - replace YOUR_USERNAME with your actual username
-nano systemd/dishwatcher-edge.service
-
-sudo cp systemd/dishwatcher-edge.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now dishwatcher-edge
-
-# check logs
-journalctl -u dishwatcher-edge -f
-```
+run: `venv/bin/python watcher.py`
 
 ## how it works
 
-1. grabs frames from usb webcam
-2. converts to grayscale + downscales to 320x240 (pi cant handle full res for motion)
-3. runs MOG2 background subtraction to find motion
-4. if motion exceeds threshold, post the full-res frame to the server
-5. enter monitoring mode: send a heartbeat frame every 30s even without motion
-6. if server says clear 3x in a row, exit monitoring
-7. if nothing is happening, sleep (cpu goes from ~100% to ~2%)
+1. idle, barely using any cpu
+2. someone walks up to the sink, motion detected
+3. starts recording frames into a 15 second ring buffer (blame clip)
+4. person walks away, motion stops
+5. waits 10 seconds for them to fully leave (so we get a clean shot)
+6. encodes the ring buffer as an mp4
+7. captures a clean photo of the sink
+8. posts both to the server
+9. enters monitoring mode, heartbeat every 30s
+10. if server says clear 3x in a row, goes back to idle
 
 ## env vars
 
-| var | default | notes |
-|-----|---------|-------|
-| `DISH_SERVER_URL` | `http://localhost:8000/upload` | **set this to your server** |
-| `DISH_API_KEY` | (empty) | shared secret, must match server |
-| `CAMERA_INDEX` | 0 | usb webcam index |
-| `FRAME_WIDTH` | 640 | capture res (what gets sent to server) |
-| `FRAME_HEIGHT` | 480 | |
-| `MOTION_WIDTH` | 320 | motion detection res (lower = less cpu) |
-| `MOTION_HEIGHT` | 240 | |
-| `MIN_CONTOUR_AREA` | 500 | noise filter in motion-frame pixels |
-| `MOTION_PERCENT` | 0.5 | % of frame that needs to move |
-| `PROCESS_EVERY_N` | 3 | only run motion detection every Nth frame |
-| `IDLE_SLEEP_MS` | 50 | sleep when idle (crucial for not pegging cpu) |
-| `MOTION_COOLDOWN_SEC` | 10 | min seconds between motion posts |
-| `JPEG_QUALITY` | 60 | compression quality |
-| `HEARTBEAT_INTERVAL_SEC` | 30 | seconds between heartbeat posts |
-| `MONITORING_DURATION_SEC` | 7200 | max monitoring time (2hr default) |
-| `CLEAR_EXIT_COUNT` | 3 | consecutive clears to exit monitoring |
+| var | default | what |
+|-----|---------|------|
+| `DISH_SERVER_URL` | `http://localhost:8000/upload` | server endpoint |
+| `DISH_API_KEY` | (empty) | must match server |
+| `CAMERA_INDEX` | 0 | usb webcam |
+| `VIDEO_FPS` | 5 | blame clip framerate |
+| `VIDEO_DURATION` | 15 | blame clip length (seconds) |
+| `CAPTURE_DELAY_SEC` | 10 | wait after motion stops |
+| `PROCESS_EVERY_N` | 3 | motion check every Nth frame |
+| `IDLE_SLEEP_MS` | 50 | sleep when idle |
+| `HEARTBEAT_INTERVAL_SEC` | 30 | monitoring heartbeat |
 
-## tuning per pi model
+## tuning
 
-**pi zero / zero 2w:** slow as shit. set `PROCESS_EVERY_N=5` and `IDLE_SLEEP_MS=100`.
+**pi zero/2w:** `PROCESS_EVERY_N=5`, `IDLE_SLEEP_MS=100`, `VIDEO_FPS=3`
 
-**pi 3b+:** defaults should be fine. if cpu is above 30% idle, bump `PROCESS_EVERY_N` to 4.
+**pi 3b+:** defaults are fine
 
-**pi 4/5:** these have headroom. can drop `PROCESS_EVERY_N` to 2 or even 1 for faster motion response.
-
-## why is this so optimized
-
-the old version had no sleep in the main loop and ran motion detection on every single full-color frame. it pegged the pi at 100% cpu doing basically nothing. now it:
-
-- runs motion on grayscale (3x less data)
-- downscales to 320x240 for motion (75% fewer pixels)
-- skips 2/3 of frames
-- sleeps when idle
-- reuses tcp connections
-- doesnt call contourArea twice per contour (lol)
-
-idle cpu went from ~100% to ~2-5%.
-
-## python 3.13 note
-
-python 3.13 has known compatibility issues with numpy + opencv. the setup script avoids it and picks 3.9-3.12 automatically. if you only have 3.13 on your system:
-
-```bash
-sudo apt install python3.11 python3.11-venv
-rm -rf venv
-./setup.sh
-```
+**pi 4/5:** can lower `PROCESS_EVERY_N` to 2 for faster response

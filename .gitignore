@@ -3,8 +3,11 @@ __pycache__/
 *.pyo
 .env
 *.pt
-images/
 data/
+images/
+videos/
 sink_location.json
+reference.jpg
+roi.json
 .venv/
 venv/
