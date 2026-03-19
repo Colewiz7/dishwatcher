@@ -9,7 +9,7 @@ services:
       - ./data:/app/data
       - ./static:/app/static
     environment:
-      - DISH_API_KEY=changeme
+      - DISH_API_KEY=api-key
       - SAVE_DIR=/app/data
       - CAMERA_ROTATION=180
       # ssim detection
