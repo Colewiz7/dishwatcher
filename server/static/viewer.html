@@ -2,190 +2,136 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Dish Watcher</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#08090a">
+<title>dishwatcher</title>
 <link rel="icon" href="/icon.png" type="image/png">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <link rel="stylesheet" href="/static/style.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 </head>
 <body>
 
 <div class="wrap">
 
-  <!-- Top bar -->
   <div class="topbar">
-    <div class="logo">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>
-      dish watcher <span>v4</span>
-    </div>
+    <div class="logo">dishwatcher <span>v5</span></div>
     <div class="topbar-spacer"></div>
-    <div class="conn-badge" id="connBadge">
-      <div class="conn-dot" id="connDot"></div>
-      <span id="connText">connecting</span>
-    </div>
-    <button class="topbar-btn" id="notifyBtn" onclick="toggleNotifications()" title="Browser notifications">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 8a6 6 0 0112 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 003.4 0"/></svg>
-      notify
-    </button>
-    <button class="topbar-btn" id="soundBtn" onclick="toggleSound()" title="Alert sounds">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 010 7.07"/></svg>
-      sound
-    </button>
+    <div class="conn"><div class="dot" id="dot"></div><span id="connTxt">...</span></div>
+    <button class="tbtn" id="notifyBtn" onclick="toggleNotify()">notify</button>
+    <button class="tbtn" id="soundBtn" onclick="toggleSound()">sound</button>
   </div>
 
-  <!-- State hero -->
-  <div class="state-hero">
-    <div class="state-orb CLEAR" id="stateOrb">&#x2713;</div>
-    <div class="state-info">
-      <h1 id="stateTitle">Sink is clear</h1>
-      <p id="stateSub">Waiting for data...</p>
+  <div class="hero">
+    <div class="orb CLEAR" id="orb">&#x2713;</div>
+    <div>
+      <h1 id="stateTitle">connecting...</h1>
+      <p id="stateSub">waiting for data</p>
     </div>
   </div>
 
-  <!-- Main grid -->
+  <div class="meter"><div class="meter-fill" id="meterFill" style="width:100%;background:var(--green)"></div></div>
+  <div class="meter-labels"><span>dirty</span><span id="ssimVal">SSIM --</span><span>clean</span></div>
+
   <div class="grid">
 
-    <!-- LEFT: Camera feed + gallery -->
-    <div>
+    <div class="panel on" id="panelFeed">
       <div class="card">
-        <div class="card-header">
-          <span class="card-title">Live feed</span>
-          <span class="card-badge" id="feedMode">--</span>
+        <div class="card-h">
+          <span class="card-t">live feed</span>
+          <span class="badge" id="feedMode">--</span>
         </div>
-        <div class="feed-wrap" id="feedWrap">
-          <div class="feed-placeholder" id="feedPlaceholder">
-            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".4"><rect x="2" y="2" width="20" height="20" rx="5"/><circle cx="12" cy="12" r="3"/><circle cx="18" cy="6" r="1"/></svg>
-            Waiting for first frame
-          </div>
-          <img id="feedImg" style="display:none" onclick="openLightbox(this.src)">
-          <div class="feed-overlay" id="feedOverlay" style="display:none">
-            <span id="feedInference">--</span>
+        <div class="feed" id="feed" onclick="openLb(feedImg.src)">
+          <div class="feed-empty" id="feedEmpty">waiting for first frame<br><small>make sure the pi is running</small></div>
+          <img id="feedImg" style="display:none">
+          <div class="feed-bar" id="feedBar" style="display:none">
+            <span id="feedMs">--</span>
             <span id="feedTime">--</span>
           </div>
         </div>
-        <div class="gallery" id="gallery"></div>
-      </div>
+        <button class="ref-btn" id="refBtn" onclick="setReference()">set clean reference</button>
 
-      <!-- Chart -->
-      <div class="card chart-card" style="margin-top:16px">
-        <div class="card-header">
-          <span class="card-title">Detection timeline (24h)</span>
-        </div>
-        <div class="chart-wrap">
-          <canvas id="timelineChart"></canvas>
+        <div class="vplayer" id="vplayer">
+          <video id="vplayerVid" controls playsinline></video>
         </div>
       </div>
 
-      <!-- Recent detections -->
-      <div class="card" style="margin-top:16px">
-        <div class="card-header">
-          <span class="card-title">Recent detections</span>
-          <span class="card-badge" id="detCount">0</span>
+      <div class="card" style="margin-top:12px">
+        <div class="card-h">
+          <span class="card-t">timeline</span>
+          <div style="display:flex;gap:6px">
+            <button class="badge" style="cursor:pointer;border:none" onclick="loadTimeline('all')" id="tlAll">all</button>
+            <button class="badge" style="cursor:pointer;border:none" onclick="loadTimeline('videos')" id="tlVids">videos</button>
+          </div>
         </div>
-        <div class="list-body" id="detList"></div>
+        <div class="timeline" id="timeline"></div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div class="card-h"><span class="card-t">detection chart (24h)</span></div>
+        <div class="chart-box"><canvas id="chart"></canvas></div>
       </div>
     </div>
 
-    <!-- RIGHT: Status panels -->
-    <div>
-      <!-- Consensus -->
+    <div class="panel on" id="panelStatus">
+
       <div class="card">
-        <div class="card-header">
-          <span class="card-title">Consensus buffer</span>
-          <span class="card-badge" id="consensusRatio">0/0</span>
-        </div>
-        <div class="consensus" id="consensusDots"></div>
-        <div class="consensus-bar">
-          <div class="consensus-fill" id="consensusFill" style="width:0;background:var(--green)"></div>
-        </div>
-        <div style="display:flex;justify-content:space-between;margin-top:6px">
-          <span style="font-family:var(--font-mono);font-size:.68rem;color:var(--tx-3)">Confidence</span>
-          <span style="font-family:var(--font-mono);font-size:.68rem;color:var(--tx-2)" id="consensusPct">0%</span>
+        <div class="card-h"><span class="card-t">consensus buffer</span><span class="badge" id="cRatio">0/0</span></div>
+        <div class="consensus" id="cDots"></div>
+        <div class="meter"><div class="meter-fill" id="cFill" style="width:0;background:var(--green)"></div></div>
+        <div class="meter-labels"><span>confidence</span><span id="cPct">0%</span></div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div class="card-h"><span class="card-t">grace timer</span><span class="badge" id="timerBadge">inactive</span></div>
+        <div class="timer" id="timerVal">--:--</div>
+        <div class="timer-sub" id="timerSub">no active timer</div>
+      </div>
+
+      <div class="card" style="margin-top:12px">
+        <div class="card-h"><span class="card-t">stats</span></div>
+        <div class="sgrid">
+          <div class="sbox"><div class="sbox-l">frames today</div><div class="sbox-v" id="sFrames">0</div></div>
+          <div class="sbox"><div class="sbox-l">dish rate</div><div class="sbox-v" id="sRate">0%</div></div>
+          <div class="sbox"><div class="sbox-l">avg ssim</div><div class="sbox-v sm" id="sSsim">--</div></div>
+          <div class="sbox"><div class="sbox-l">total alerts</div><div class="sbox-v" id="sAlerts">0</div></div>
         </div>
       </div>
 
-      <!-- Grace timer -->
-      <div class="card" style="margin-top:16px" id="timerCard">
-        <div class="card-header">
-          <span class="card-title">Grace timer</span>
-          <span class="card-badge" id="timerState">inactive</span>
-        </div>
-        <div class="timer" id="timerDisplay">--:--</div>
-        <div class="timer-sub" id="timerSub">No active timer</div>
+      <div class="card" style="margin-top:12px">
+        <div class="card-h"><span class="card-t">state events</span><span class="badge" id="evtCount">0</span></div>
+        <div class="elist" id="evtList"></div>
       </div>
 
-      <!-- Stats -->
-      <div class="card" style="margin-top:16px">
-        <div class="card-header">
-          <span class="card-title">Statistics</span>
-        </div>
-        <div class="stats-grid">
-          <div class="stat">
-            <div class="stat-label">Frames today</div>
-            <div class="stat-value" id="statFrames">0</div>
-          </div>
-          <div class="stat">
-            <div class="stat-label">Dish rate</div>
-            <div class="stat-value" id="statDishRate">0%</div>
-          </div>
-          <div class="stat">
-            <div class="stat-label">Avg inference</div>
-            <div class="stat-value sm" id="statInference">-- ms</div>
-          </div>
-          <div class="stat">
-            <div class="stat-label">Total alerts</div>
-            <div class="stat-value" id="statAlerts">0</div>
-          </div>
-          <div class="stat">
-            <div class="stat-label">Last hour</div>
-            <div class="stat-value sm" id="statHour">0 frames</div>
-          </div>
-          <div class="stat">
-            <div class="stat-label">Transitions</div>
-            <div class="stat-value" id="statTransitions">0</div>
-          </div>
+      <div class="card" style="margin-top:12px">
+        <div class="card-h"><span class="card-t">admin</span></div>
+        <div class="admin-bar" style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="abtn" onclick="setReference()">set reference</button>
+          <button class="abtn" onclick="adminPost('/admin/auto-detect-sink')">detect sink</button>
+          <button class="abtn" onclick="adminPost('/admin/force-state?state=CLEAR')">force clear</button>
+          <button class="abtn warn" onclick="adminPost('/admin/force-state?state=ALERTED')">force alert</button>
+          <button class="abtn" onclick="adminPost('/admin/test-notify')">test notify</button>
         </div>
       </div>
 
-      <!-- State events -->
-      <div class="card" style="margin-top:16px">
-        <div class="card-header">
-          <span class="card-title">State events</span>
-          <span class="card-badge" id="eventCount">0</span>
-        </div>
-        <div class="list-body" id="eventList"></div>
-      </div>
-
-      <!-- Admin -->
-      <div class="card" style="margin-top:16px">
-        <div class="card-header">
-          <span class="card-title">Admin controls</span>
-        </div>
-        <div class="admin-bar">
-          <button class="admin-btn" onclick="adminAction('/admin/reset-sink','POST')">Reset sink</button>
-          <div class="admin-sep"></div>
-          <button class="admin-btn" onclick="adminAction('/admin/force-state?state=CLEAR','POST')">Force clear</button>
-          <button class="admin-btn" onclick="adminAction('/admin/force-state?state=CONFIRMED','POST')">Force confirmed</button>
-          <button class="admin-btn danger" onclick="adminAction('/admin/force-state?state=ALERTED','POST')">Force alert</button>
-          <div class="admin-sep"></div>
-          <button class="admin-btn" onclick="adminAction('/admin/test-notify','POST')">Test notify</button>
-        </div>
-      </div>
     </div>
-
   </div>
 </div>
 
-<!-- Toast container -->
-<div class="toast-container" id="toasts"></div>
+<div class="toasts" id="toasts"></div>
+<div class="lb" id="lb" onclick="closeLb()"><img id="lbImg"><video id="lbVid" controls playsinline style="display:none"></div>
 
-<!-- Lightbox -->
-<div class="lightbox" id="lightbox" onclick="closeLightbox()">
-  <img id="lightboxImg">
-  <button class="lightbox-close" onclick="closeLightbox()">&times;</button>
-</div>
+<nav class="bnav">
+  <button class="bnav-btn on" onclick="showPanel('panelFeed',this)" id="navFeed">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+    feed
+  </button>
+  <button class="bnav-btn" onclick="showPanel('panelStatus',this)" id="navStatus">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+    status
+  </button>
+</nav>
 
 <script src="/static/app.js"></script>
 </body>
