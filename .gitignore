@@ -1,13 +1,12 @@
 __pycache__/
 *.pyc
-*.pyo
 .env
 *.pt
 data/
 images/
 videos/
-sink_location.json
+thumbs/
 reference.jpg
 roi.json
-.venv/
+config.json
 venv/

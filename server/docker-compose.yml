@@ -9,9 +9,11 @@ services:
       - ./data:/app/data
       - ./static:/app/static
     environment:
-      - DISH_API_KEY=api-key
+      - DISH_API_KEY=changeme
       - SAVE_DIR=/app/data
       - CAMERA_ROTATION=180
+      # dashboard password (leave empty to disable)
+      - ADMIN_PASSWORD=
       # ssim detection
       - SSIM_THRESHOLD=0.82
       - YOLO_ENABLED=true

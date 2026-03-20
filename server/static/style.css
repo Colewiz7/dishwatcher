@@ -208,3 +208,49 @@ body{font-family:var(--font);color:var(--tx-1);background:var(--bg-0);min-height
 /* mobile panels */
 .panel{display:block}
 @media(max-width:767px){.panel{display:none}.panel.on{display:block}}
+
+/* settings panel */
+.settings-group{margin-bottom:16px}
+.settings-group-title{
+  font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--accent);margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--bd);
+}
+.setting-row{
+  display:flex;align-items:center;gap:12px;padding:8px 0;
+  border-bottom:1px solid var(--bd);
+}
+.setting-row:last-child{border-bottom:none}
+.setting-label{flex:1;min-width:0}
+.setting-label .name{font-size:.8rem;color:var(--tx-1)}
+.setting-label .desc{font-size:.65rem;color:var(--tx-3);margin-top:1px}
+.setting-ctrl{flex-shrink:0;display:flex;align-items:center;gap:6px}
+.setting-ctrl input[type=number],
+.setting-ctrl input[type=text],
+.setting-ctrl input[type=password]{
+  width:100px;padding:5px 8px;border-radius:var(--r-sm);
+  border:1px solid var(--bd);background:var(--bg-2);color:var(--tx-0);
+  font-family:var(--mono);font-size:.75rem;
+}
+.setting-ctrl input[type=text],
+.setting-ctrl input[type=password]{width:180px}
+.setting-ctrl select{
+  padding:5px 8px;border-radius:var(--r-sm);
+  border:1px solid var(--bd);background:var(--bg-2);color:var(--tx-0);
+  font-family:var(--mono);font-size:.75rem;
+}
+.toggle{
+  width:36px;height:20px;border-radius:10px;background:var(--bg-4);
+  position:relative;cursor:pointer;transition:background .2s;flex-shrink:0;
+}
+.toggle.on{background:var(--accent)}
+.toggle::after{
+  content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;
+  border-radius:50%;background:#fff;transition:transform .2s;
+}
+.toggle.on::after{transform:translateX(16px)}
+.setting-val{font-family:var(--mono);font-size:.68rem;color:var(--tx-2);min-width:32px;text-align:right}
+@media(max-width:767px){
+  .setting-row{flex-wrap:wrap}
+  .setting-ctrl{width:100%}
+  .setting-ctrl input[type=text],.setting-ctrl input[type=password]{width:100%}
+}

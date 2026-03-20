@@ -31,11 +31,17 @@ function connectSSE() {
     updateRefBtn();
     loadTimeline(timelineMode);
     loadEvents();
+    initSettingsPanel(d);
   });
 
   sse.addEventListener('detection', e => onDetection(JSON.parse(e.data)));
   sse.addEventListener('state', e => onStateChange(JSON.parse(e.data)));
   sse.addEventListener('heartbeat', () => setConn(true));
+  sse.addEventListener('config', e => {
+    const d = JSON.parse(e.data);
+    if (d.config) { renderSettings(d.config); applyUiConfig(d.config); }
+    toast('settings updated');
+  });
   sse.addEventListener('admin', e => {
     const d = JSON.parse(e.data);
     if (d.has_reference !== undefined) {
@@ -101,8 +107,17 @@ function onDetection(d) {
     dishes: d.dishes_found,
     ssim: d.ssim_score,
     labels: d.labels || [],
-    video: d.video_file || null,
   });
+
+  // add blame clip as separate timeline entry
+  if (d.video_file) {
+    addTimelineItem({
+      type: 'video',
+      filename: d.video_file,
+      timestamp: d.timestamp,
+      thumb_url: d.video_thumb ? '/view/thumb/' + d.video_thumb : null,
+    });
+  }
 
   // browser notification on alert
   if (d.should_alert) {
@@ -244,12 +259,16 @@ function makeTimelineEl(item) {
   el.className = 'tl-item';
 
   const isVideo = item.type === 'video';
-  const thumbUrl = isVideo ? '' : '/view/image/' + item.filename;
-  const time = item.timestamp ? new Date(item.timestamp).toLocaleTimeString() : item.timestamp_fmt || '';
+  const thumbUrl = isVideo
+    ? (item.thumb_url || '')
+    : '/view/image/' + item.filename;
+  const time = item.timestamp
+    ? new Date(item.timestamp).toLocaleString([], {hour:'numeric',minute:'2-digit',month:'short',day:'numeric'})
+    : item.timestamp_fmt || '';
 
   let tag = '';
   if (isVideo) {
-    tag = '<span class="tl-tag video">video</span>';
+    tag = '<span class="tl-tag video">\u25B6 blame clip</span>';
   } else {
     tag = item.dishes
       ? '<span class="tl-tag dirty">dirty</span>'
@@ -259,14 +278,18 @@ function makeTimelineEl(item) {
   const ssimTxt = item.ssim !== undefined && item.ssim !== null ? ' ssim ' + Number(item.ssim).toFixed(3) : '';
   const labelsTxt = (item.labels || []).join(', ');
 
+  // video thumb: use actual thumbnail if available, otherwise play icon
+  const thumbHtml = (isVideo && !item.thumb_url)
+    ? '<div class="tl-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--accent);font-size:1.2rem">\u25B6</div>'
+    : '<img class="tl-thumb" src="' + thumbUrl + '" loading="lazy">';
+
   el.innerHTML =
-    (isVideo
-      ? '<div class="tl-thumb" style="display:flex;align-items:center;justify-content:center;color:var(--accent);font-size:1.2rem">\u25B6</div>'
-      : '<img class="tl-thumb" src="' + thumbUrl + '" loading="lazy">') +
+    thumbHtml +
     '<div class="tl-meta">' +
       '<div class="tl-time">' + time + '</div>' +
-      '<div class="tl-status">' + (isVideo ? item.filename : (item.dishes ? 'dishes detected' : 'clear') + ssimTxt) + '</div>' +
+      '<div class="tl-status">' + (isVideo ? 'blame clip' : (item.dishes ? 'dishes detected' : 'clear') + ssimTxt) + '</div>' +
       (labelsTxt ? '<div class="tl-labels">' + labelsTxt + '</div>' : '') +
+      (item.size_kb ? '<div class="tl-labels">' + item.size_kb + ' KB</div>' : '') +
     '</div>' +
     tag;
 
@@ -320,6 +343,7 @@ async function loadTimeline(mode) {
         addTimelineItem({
           type: 'video', filename: v.filename, timestamp_fmt: v.timestamp,
           dishes: null, ssim: null, labels: [],
+          thumb_url: v.thumb_url || null, size_kb: v.size_kb || null,
         });
       });
     }
@@ -560,3 +584,188 @@ function showPanel(id, btn) {
 // -- go --
 
 connectSSE();
+
+// -- settings --
+
+let settingsPassword = '';
+let settingsUnlocked = false;
+let settingsData = {};
+let passwordRequired = false;
+
+function renderSettings(schema) {
+  settingsData = schema;
+  const container = document.getElementById('settingsGroups');
+  container.innerHTML = '';
+
+  // group settings by their group key
+  const groups = {};
+  for (const [key, s] of Object.entries(schema)) {
+    const g = s.group || 'other';
+    if (!groups[g]) groups[g] = [];
+    groups[g].push({key, ...s});
+  }
+
+  const groupOrder = ['detection', 'camera', 'video', 'timing', 'notifications', 'ui', 'admin'];
+  const groupLabels = {
+    detection: 'detection', camera: 'camera', video: 'video',
+    timing: 'timing', notifications: 'notifications', ui: 'dashboard', admin: 'admin'
+  };
+
+  for (const gKey of groupOrder) {
+    const items = groups[gKey];
+    if (!items) continue;
+
+    const groupEl = document.createElement('div');
+    groupEl.className = 'settings-group';
+    groupEl.innerHTML = '<div class="settings-group-title">' + (groupLabels[gKey] || gKey) + '</div>';
+
+    for (const s of items) {
+      const row = document.createElement('div');
+      row.className = 'setting-row';
+
+      let ctrl = '';
+      if (s.type === 'bool') {
+        ctrl = '<div class="toggle ' + (s.value ? 'on' : '') + '" data-key="' + s.key + '" onclick="toggleSetting(this)"></div>';
+      } else if (s.type === 'int' || s.type === 'float') {
+        const step = s.step || (s.type === 'float' ? 0.01 : 1);
+        const min = s.min !== undefined ? ' min="' + s.min + '"' : '';
+        const max = s.max !== undefined ? ' max="' + s.max + '"' : '';
+        ctrl = '<input type="number" data-key="' + s.key + '" value="' + s.value + '" step="' + step + '"' + min + max + '>';
+      } else if (s.type === 'select') {
+        const opts = (s.options || []).map(o =>
+          '<option value="' + o + '"' + (o === s.value ? ' selected' : '') + '>' + o + '</option>'
+        ).join('');
+        ctrl = '<select data-key="' + s.key + '">' + opts + '</select>';
+      } else if (s.type === 'password') {
+        ctrl = '<input type="password" data-key="' + s.key + '" value="' + (s.value || '') + '" placeholder="leave empty to disable">';
+      } else {
+        ctrl = '<input type="text" data-key="' + s.key + '" value="' + (s.value || '') + '">';
+      }
+
+      row.innerHTML =
+        '<div class="setting-label">' +
+          '<div class="name">' + (s.label || s.key) + '</div>' +
+          (s.desc ? '<div class="desc">' + s.desc + '</div>' : '') +
+        '</div>' +
+        '<div class="setting-ctrl">' + ctrl + '</div>';
+
+      groupEl.appendChild(row);
+    }
+
+    container.appendChild(groupEl);
+  }
+}
+
+function toggleSetting(el) {
+  el.classList.toggle('on');
+}
+
+async function unlockSettings() {
+  const pw = document.getElementById('settingsPw').value;
+
+  try {
+    const r = await fetch('/config/check-password', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: pw}),
+    });
+    const d = await r.json();
+
+    if (d.valid) {
+      settingsPassword = pw;
+      settingsUnlocked = true;
+      document.getElementById('settingsLock').style.display = 'none';
+      document.getElementById('settingsBody').style.display = 'block';
+      loadSettings();
+      toast('settings unlocked');
+    } else {
+      toast('wrong password');
+      document.getElementById('settingsPw').value = '';
+    }
+  } catch(e) {
+    toast('error: ' + e.message);
+  }
+}
+
+async function loadSettings() {
+  try {
+    const r = await fetch('/config/schema');
+    const schema = await r.json();
+    renderSettings(schema);
+    applyUiConfig(schema);
+  } catch(e) {
+    toast('failed to load settings');
+  }
+}
+
+async function saveSettings() {
+  const changes = {};
+
+  // collect all values from the form
+  document.querySelectorAll('#settingsGroups [data-key]').forEach(el => {
+    const key = el.dataset.key;
+    const schema = settingsData[key];
+    if (!schema) return;
+
+    if (schema.type === 'bool') {
+      changes[key] = el.classList.contains('on');
+    } else if (schema.type === 'int') {
+      changes[key] = parseInt(el.value) || 0;
+    } else if (schema.type === 'float') {
+      changes[key] = parseFloat(el.value) || 0;
+    } else {
+      changes[key] = el.value;
+    }
+  });
+
+  try {
+    const r = await fetch('/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: settingsPassword, changes}),
+    });
+    const d = await r.json();
+
+    if (d.status === 'ok') {
+      toast('saved: ' + (d.changed || []).join(', '));
+      loadSettings();
+    } else {
+      toast('save failed: ' + (d.detail || 'unknown'));
+    }
+  } catch(e) {
+    toast('error: ' + e.message);
+  }
+}
+
+function applyUiConfig(schema) {
+  // show/hide dashboard sections based on ui_ settings
+  const map = {
+    'ui_show_chart': '.chart-box',
+    'ui_show_consensus': '#panelStatus .card:nth-child(1)',
+    'ui_show_timer': '#panelStatus .card:nth-child(2)',
+    'ui_show_stats': '#panelStatus .card:nth-child(3)',
+    'ui_show_events': '#panelStatus .card:nth-child(4)',
+  };
+
+  // find parent cards by content instead of nth-child (more robust)
+  if (schema.ui_show_chart) {
+    const chartCard = document.querySelector('.chart-box');
+    if (chartCard) chartCard.closest('.card').style.display = schema.ui_show_chart.value ? '' : 'none';
+  }
+}
+
+function initSettingsPanel(data) {
+  passwordRequired = data.password_required || false;
+
+  if (!passwordRequired) {
+    // no password set, unlock immediately
+    settingsUnlocked = true;
+    document.getElementById('settingsLock').style.display = 'none';
+    document.getElementById('settingsBody').style.display = 'block';
+  }
+
+  if (data.config) {
+    renderSettings(data.config);
+    applyUiConfig(data.config);
+  }
+}

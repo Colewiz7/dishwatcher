@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # cache yolo weights in image layer
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
 
-COPY server.py detector.py storage.py state_machine.py notifier.py ./
+COPY server.py detector.py storage.py state_machine.py notifier.py config.py ./
 COPY static/ ./static/
 
 RUN mkdir -p /app/data /app/data/images /app/data/videos
