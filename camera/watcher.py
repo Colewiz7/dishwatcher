@@ -126,37 +126,44 @@ class VideoBuffer:
                 self._last_save = now
 
     def encode_video(self):
-        """turn the buffer into an mp4. returns (path, success)"""
+        """turn the buffer into a browser-playable h264 mp4 using ffmpeg"""
         if len(self._buf) < 5:
             return None, False
 
-        # decode first frame for dimensions
-        first = cv2.imdecode(
-            np.frombuffer(self._buf[0], np.uint8), cv2.IMREAD_COLOR)
-        h, w = first.shape[:2]
+        import subprocess, shutil
+        tmpdir = tempfile.mkdtemp(prefix="blame_")
+        mp4_path = os.path.join(tempfile.gettempdir(), "blame_clip.mp4")
 
-        path = os.path.join(tempfile.gettempdir(), "blame_clip.mp4")
+        try:
+            for i, jpeg_bytes in enumerate(self._buf):
+                with open(os.path.join(tmpdir, f"{i:04d}.jpg"), "wb") as f:
+                    f.write(jpeg_bytes)
 
-        # try mp4v first, fallback to MJPEG avi
-        for fourcc_str, ext in [("mp4v", ".mp4"), ("MJPG", ".avi")]:
-            fpath = path.rsplit(".", 1)[0] + ext
-            fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
-            writer = cv2.VideoWriter(fpath, fourcc, self._fps, (w, h))
-            if writer.isOpened():
-                for jpeg_bytes in self._buf:
-                    frm = cv2.imdecode(
-                        np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
-                    if frm is not None:
-                        writer.write(frm)
-                writer.release()
-                size_kb = os.path.getsize(fpath) / 1024
-                log.info("video encoded: %s (%.0f KB, %d frames)",
-                         ext, size_kb, len(self._buf))
-                return fpath, True
-            writer.release()
+            cmd = [
+                "ffmpeg", "-y",
+                "-framerate", str(self._fps),
+                "-i", os.path.join(tmpdir, "%04d.jpg"),
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-crf", "28", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart", mp4_path,
+            ]
+            r = subprocess.run(cmd, capture_output=True, timeout=30)
 
-        log.warning("couldnt encode video, no working codec")
-        return None, False
+            if r.returncode == 0 and os.path.isfile(mp4_path):
+                size_kb = os.path.getsize(mp4_path) / 1024
+                log.info("video: h264 mp4 (%.0f KB, %d frames)", size_kb, len(self._buf))
+                return mp4_path, True
+            else:
+                log.warning("ffmpeg failed: %s", (r.stderr or b"")[-200:].decode(errors="replace"))
+                return None, False
+        except FileNotFoundError:
+            log.error("ffmpeg not found. sudo apt install ffmpeg")
+            return None, False
+        except Exception as e:
+            log.error("encode failed: %s", e)
+            return None, False
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def clear(self):
         self._buf.clear()
