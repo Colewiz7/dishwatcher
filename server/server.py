@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -78,6 +79,29 @@ run_self_checks()
 
 # camera health, reported by the edge node on each upload
 CAMERA = {"seen": False, "last_report": None, "stats": {}}
+
+# Last detection and a short event ring, so the dashboard has something to
+# paint immediately on load instead of a cold spinner.
+from collections import deque  # noqa: E402
+LAST_DETECTION = {}
+EVENTS = deque(maxlen=60)
+
+# Live view.
+#
+# The Pi never accepts inbound connections (it moves between networks and sits
+# behind NAT), so the browser cannot pull from it directly. Instead the server
+# holds a "live wanted until" deadline; the camera reads that off every health
+# report and, while it is in the future, pushes frames here at LIVE_FPS. The
+# browser consumes them as multipart MJPEG.
+#
+# The deadline auto-expires so a closed browser tab cannot leave the Pi
+# streaming forever and burning its USB bus and battery of CPU.
+LIVE = {"wanted_until": 0.0, "frame": None, "frame_at": 0.0, "seq": 0}
+LIVE_LEASE_SEC = float(os.environ.get("LIVE_LEASE_SEC", "120"))
+
+
+def record_event(kind, message):
+    EVENTS.appendleft({"at": datetime.now().isoformat(), "kind": kind, "message": message})
 
 
 def _get_rotation():
@@ -200,6 +224,107 @@ async def prometheus_metrics():
     return Response(content=metrics.render(), media_type="text/plain; version=0.0.4")
 
 
+@app.post("/live/request")
+async def live_request():
+    """Browser asks for live view. Extends the lease the camera polls."""
+    LIVE["wanted_until"] = time.time() + LIVE_LEASE_SEC
+    return JSONResponse({"live": True, "lease_seconds": LIVE_LEASE_SEC})
+
+
+@app.post("/live/stop")
+async def live_stop():
+    LIVE["wanted_until"] = 0.0
+    return JSONResponse({"live": False})
+
+
+@app.get("/live/state")
+async def live_state():
+    remaining = max(0.0, LIVE["wanted_until"] - time.time())
+    return JSONResponse({
+        "live_wanted": remaining > 0,
+        "lease_remaining": round(remaining, 1),
+        "have_frame": LIVE["frame"] is not None,
+        "frame_age": round(time.time() - LIVE["frame_at"], 1) if LIVE["frame_at"] else None,
+    })
+
+
+@app.post("/live/frame")
+async def live_frame(frame: UploadFile = File(...),
+                     x_api_key: Optional[str] = Header(default=None)):
+    """Camera pushes a frame while the live lease is active."""
+    _check_api_key(x_api_key)
+    raw = await frame.read()
+    if raw:
+        LIVE["frame"] = raw
+        LIVE["frame_at"] = time.time()
+        LIVE["seq"] += 1
+    remaining = max(0.0, LIVE["wanted_until"] - time.time())
+    # tell the camera whether to keep going, so it stops on its own
+    return JSONResponse({"keep_streaming": remaining > 0,
+                         "lease_remaining": round(remaining, 1)})
+
+
+@app.get("/live.mjpg")
+async def live_mjpeg(request: Request):
+    """
+    Multipart MJPEG of whatever the camera last pushed.
+
+    Requesting the stream also renews the lease, so simply having the tab open
+    keeps frames flowing and closing it lets them stop.
+    """
+    boundary = "dishwatcherframe"
+
+    async def gen():
+        last_seq = -1
+        idle_since = time.time()
+        # NOTE: deliberately no request.is_disconnected() here. For a GET with
+        # no body it awaits receive(), which does not return until the client
+        # actually disconnects, so it blocks the generator forever and the
+        # stream yields nothing. Starlette closes the generator on disconnect
+        # anyway, and the idle timeout below bounds the rest.
+        while True:
+            LIVE["wanted_until"] = time.time() + LIVE_LEASE_SEC
+            if LIVE["frame"] is not None and LIVE["seq"] != last_seq:
+                last_seq = LIVE["seq"]
+                idle_since = time.time()
+                chunk = LIVE["frame"]
+                yield (f"--{boundary}\r\nContent-Type: image/jpeg\r\n"
+                       f"Content-Length: {len(chunk)}\r\n\r\n").encode() + chunk + b"\r\n"
+            else:
+                # no new frame yet; give up after a while rather than hanging
+                if time.time() - idle_since > 30:
+                    break
+            await asyncio.sleep(0.08)
+
+    return StreamingResponse(
+        gen(),
+        media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+        headers={"Cache-Control": "no-cache, no-store", "Pragma": "no-cache",
+                 "X-Accel-Buffering": "no"})
+
+
+@app.get("/images/{filename}")
+async def get_image(filename: str):
+    # basename only: never let a path component escape the data directory
+    path = storage.get_image_path(Path(filename).name)
+    if not path or not Path(path).is_file():
+        raise HTTPException(404, "no such image")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/videos/{filename}")
+async def get_video(filename: str):
+    path = storage.get_video_path(Path(filename).name)
+    if not path or not Path(path).is_file():
+        raise HTTPException(404, "no such video")
+    return FileResponse(path, media_type="video/mp4")
+
+
+@app.get("/")
+async def index():
+    return FileResponse(STATIC_DIR / "viewer.html")
+
+
 @app.get("/calibration")
 async def calibration_status():
     return JSONResponse(calib.state().as_dict())
@@ -213,6 +338,7 @@ async def calibration_set_reference():
         raise HTTPException(409, "no capture available yet; wait for the camera to send one")
     state = calib.set_reference(frame)
     run_self_checks()
+    record_event("info", "clean reference set")
     await broadcaster.publish("calibration", state.as_dict())
     return JSONResponse(state.as_dict())
 
@@ -225,6 +351,7 @@ async def calibration_set_roi(request: Request):
         raise HTTPException(422, "sink must be [x1, y1, x2, y2]")
     state = calib.set_roi({"sink": [int(v) for v in sink]})
     run_self_checks()
+    record_event("info", "sink area set")
     await broadcaster.publish("calibration", state.as_dict())
     return JSONResponse(state.as_dict())
 
@@ -233,6 +360,7 @@ async def calibration_set_roi(request: Request):
 async def calibration_clear():
     state = calib.clear()
     run_self_checks()
+    record_event("info", "calibration cleared")
     await broadcaster.publish("calibration", state.as_dict())
     return JSONResponse(state.as_dict())
 
@@ -244,7 +372,10 @@ async def camera_report(request: Request, x_api_key: Optional[str] = Header(defa
     CAMERA["stats"] = await request.json()
     CAMERA["seen"] = True
     CAMERA["last_report"] = datetime.now().isoformat()
-    return JSONResponse({"ok": True})
+    remaining = max(0.0, LIVE["wanted_until"] - time.time())
+    return JSONResponse({"ok": True, "live_wanted": remaining > 0,
+                         "lease_remaining": round(remaining, 1),
+                         "live_fps": float(os.environ.get("LIVE_FPS", "4"))})
 
 
 @app.get("/config/schema")
@@ -335,9 +466,86 @@ async def sse_stream(request: Request):
 
 # -- status --
 
+def _dashboard_payload():
+    """
+    Everything the dashboard needs in one object.
+
+    Deliberately a single shape shared by GET /status and the SSE stream, so
+    the page has exactly one renderer and cannot drift between the two paths.
+    """
+    st = sm.get_status()
+    cal = calib.state()
+    last = LAST_DETECTION
+
+    seconds_in_state = None
+    if st.get("entered_at"):
+        try:
+            seconds_in_state = (datetime.now() - datetime.fromisoformat(st["entered_at"])).total_seconds()
+        except Exception:
+            pass
+
+    grace = st.get("grace_remaining")
+    seconds_until_alert = None
+    if grace:
+        try:
+            h, m, s = str(grace).split(":")
+            seconds_until_alert = int(h) * 3600 + int(m) * 60 + float(s)
+        except Exception:
+            pass
+
+    cam = dict(CAMERA.get("stats") or {})
+    frame_name = last.get("image_file") if last else None
+
+    return {
+        "state": st.get("state"),
+        "seconds_in_state": seconds_in_state,
+        "seconds_until_alert": seconds_until_alert,
+        "calibration": cal.as_dict(),
+        "ssim_score": last.get("ssim_score") if last else None,
+        "ssim_tiles": last.get("ssim_tiles", []) if last else [],
+        "ssim_threshold": config.get("ssim_threshold", 0.82),
+        "labels": last.get("labels", []) if last else [],
+        "inference_ms": last.get("inference_ms") if last else None,
+        "camera": cam,
+        "camera_seen": CAMERA["seen"],
+        "latest_frame_url": f"/images/{frame_name}" if frame_name else None,
+        "latest_frame_age_seconds": (
+            (datetime.now() - datetime.fromisoformat(last["at"])).total_seconds()
+            if last and last.get("at") else None),
+        "live": {
+            "wanted": max(0.0, LIVE["wanted_until"] - time.time()) > 0,
+            "have_frame": LIVE["frame"] is not None,
+            "frame_age": round(time.time() - LIVE["frame_at"], 1) if LIVE["frame_at"] else None,
+        },
+        "events": list(EVENTS),
+        "consensus": st.get("consensus"),
+    }
+
+
 @app.get("/status")
 async def status():
-    return JSONResponse(sm.get_status())
+    return JSONResponse(_dashboard_payload())
+
+
+@app.get("/status/stream")
+async def status_stream(request: Request):
+    """SSE feed of the same payload GET /status returns."""
+    async def gen():
+        yield f"data: {json.dumps(_dashboard_payload(), default=str)}\n\n"
+        q = broadcaster.subscribe()
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(q.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    pass
+                yield f"data: {json.dumps(_dashboard_payload(), default=str)}\n\n"
+        finally:
+            broadcaster.unsubscribe(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 @app.get("/status/stats")
 async def status_stats():
@@ -485,6 +693,7 @@ async def upload_frame(
         storage.save_frame(img, False, state="UNCALIBRATED",
                            quality=config.get("jpeg_quality", 90))
         log.warning("upload rejected: not calibrated (%s)", e.reason)
+        record_event("alert", f"upload rejected, not calibrated: {e.reason}")
         await broadcaster.publish("calibration", calib.state().as_dict())
         return JSONResponse(
             {"state": "UNCALIBRATED", "calibrated": False, "reason": e.reason,
@@ -542,6 +751,21 @@ async def upload_frame(
         "ssim_tiles": result.get("ssim_tiles", []),
         "ssim_threshold": config.get("ssim_threshold", 0.82),
     }
+    LAST_DETECTION.clear()
+    LAST_DETECTION.update({
+        "at": datetime.now().isoformat(),
+        "ssim_score": result["ssim_score"],
+        "ssim_tiles": result.get("ssim_tiles", []),
+        "labels": result["labels"],
+        "inference_ms": result["inference_ms"],
+        "image_file": img_filename,
+    })
+    if sm_result["changed"]:
+        pretty = {"CLEAR": "sink is clear", "CONFIRMED": "dishes confirmed",
+                  "ALERTED": "grace period expired"}.get(sm_result["state"], sm_result["state"])
+        record_event("dirty" if sm_result["state"] == "CONFIRMED" else
+                     "alert" if sm_result["state"] == "ALERTED" else "info", pretty)
+
     await broadcaster.publish("detection", sse_payload)
 
     if sm_result["changed"]:

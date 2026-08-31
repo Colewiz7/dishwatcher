@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <title>dishwatcher</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 
@@ -44,6 +44,7 @@
     <div class="readings" style="margin-top:20px">
       <div class="reading"><span class="k">Since</span><span class="v skeleton" id="since">--</span></div>
       <div class="reading"><span class="k">Alert in</span><span class="v skeleton" id="alert-in">--</span></div>
+      <div class="reading"><span class="k">Agreement</span><span class="v skeleton" id="consensus">--</span></div>
     </div>
   </div>
 
@@ -82,9 +83,14 @@
 
   <!-- latest frame -->
   <div class="card wide">
-    <h2>Latest capture</h2>
-    <img class="frame" id="frame" alt="latest sink capture">
+    <h2 id="view-title">Latest capture</h2>
+    <div class="viewport">
+      <img class="frame" id="frame" alt="latest sink capture">
+      <img class="frame" id="live" alt="live camera view" hidden>
+      <span class="pill pill-bad live-badge" id="live-badge" hidden><span class="dot"></span>LIVE</span>
+    </div>
     <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
+      <button id="live-toggle">Live view</button>
       <button class="primary" id="set-ref">Set clean reference</button>
       <button id="set-roi">Draw sink area</button>
       <button class="danger" id="clear-calib">Clear calibration</button>
@@ -102,6 +108,6 @@
 
 </div>
 
-<script src="app.js"></script>
+<script src="/static/app.js"></script>
 </body>
 </html>

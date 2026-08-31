@@ -90,6 +90,17 @@ function render(d) {
   setText('state-value', st.word);
   setText('state-label', st.label, { animate: false });
   setText('since', humanDuration(d.seconds_in_state));
+
+  /* The state machine needs a majority of recent frames to agree before it
+   * moves. Without showing that, a fresh dirty reading next to a "Clean" hero
+   * looks like a contradiction rather than a vote in progress. */
+  const cons = d.consensus;
+  if (cons && cons.size) {
+    const need = cons.threshold, votes = cons.positive;
+    setText('consensus', `${votes}/${need} say dishes`);
+  } else {
+    setText('consensus', 'no frames yet');
+  }
   setText('alert-in', d.seconds_until_alert === null || d.seconds_until_alert === undefined
     ? 'not counting' : humanDuration(d.seconds_until_alert));
 
@@ -224,7 +235,7 @@ function markStale() {
 function connect() {
   let es;
   try {
-    es = new EventSource('status/stream');
+    es = new EventSource('/status/stream');
   } catch (e) {
     return poll();
   }
@@ -243,7 +254,7 @@ function connect() {
 
 async function poll() {
   try {
-    const r = await fetch('status');
+    const r = await fetch('/status');
     if (r.ok) {
       render(await r.json());
       pill($('conn'), 'ok', 'live');
@@ -267,7 +278,7 @@ async function post(path, body) {
 $('set-ref').addEventListener('click', async (e) => {
   e.target.disabled = true;
   try {
-    const res = await post('calibration/reference');
+    const res = await post('/calibration/reference');
     if (!res.valid) alert('Reference saved, but calibration is still incomplete:\n\n' + res.reason);
   } catch (err) {
     alert('Could not set reference: ' + err.message);
@@ -277,7 +288,7 @@ $('set-ref').addEventListener('click', async (e) => {
 $('clear-calib').addEventListener('click', async (e) => {
   if (!confirm('Clear the reference and sink area? Detection stops until you set them again.')) return;
   e.target.disabled = true;
-  try { await post('calibration/clear'); } catch (err) { alert(err.message); }
+  try { await post('/calibration/clear'); } catch (err) { alert(err.message); }
   finally { e.target.disabled = false; }
 });
 
@@ -286,9 +297,52 @@ $('set-roi').addEventListener('click', () => {
   if (!cur) return;
   const parts = cur.split(',').map(s => parseInt(s.trim(), 10));
   if (parts.length !== 4 || parts.some(isNaN)) return alert('Need four numbers: x1,y1,x2,y2');
-  post('calibration/roi', { sink: parts })
+  post('/calibration/roi', { sink: parts })
     .then(res => { if (!res.valid) alert('Saved, but still not calibrated:\n\n' + res.reason); })
     .catch(err => alert('Could not set sink area: ' + err.message));
+});
+
+/* ---------- live view ----------
+ * The Pi cannot accept inbound connections, so it pushes frames to the server
+ * while a lease is held and the browser reads them back as multipart MJPEG.
+ * Opening the stream renews the lease; closing the tab lets it lapse, so the
+ * Pi stops on its own rather than streaming forever.
+ */
+
+let liveOn = false;
+
+function setLive(on) {
+  liveOn = on;
+  const img = $('live'), still = $('frame'), badge = $('live-badge');
+  $('live-toggle').textContent = on ? 'Stop live view' : 'Live view';
+  $('view-title').textContent = on ? 'Live view' : 'Latest capture';
+  badge.hidden = !on;
+  still.hidden = on;
+  img.hidden = !on;
+  if (on) {
+    img.src = '/live.mjpg?t=' + Date.now();
+  } else {
+    img.removeAttribute('src');   // drops the connection so the lease lapses
+  }
+}
+
+$('live-toggle').addEventListener('click', async (e) => {
+  e.target.disabled = true;
+  try {
+    if (liveOn) { await post('/live/stop'); setLive(false); }
+    else { await post('/live/request'); setLive(true); }
+  } catch (err) {
+    alert('Live view failed: ' + err.message);
+  } finally { e.target.disabled = false; }
+});
+
+// a wedged or absent camera cannot serve live frames; say so rather than
+// showing a broken image icon
+$('live').addEventListener('error', () => {
+  if (liveOn) { $('live-badge').className = 'pill pill-warn live-badge'; }
+});
+$('live').addEventListener('load', () => {
+  $('live-badge').className = 'pill pill-bad live-badge';
 });
 
 /* ---------- boot: cache first ---------- */

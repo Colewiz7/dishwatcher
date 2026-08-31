@@ -46,7 +46,9 @@ def _env(key, default):
 # -- config --
 
 SERVER_URL       = _env("DISH_SERVER_URL", "http://localhost:8000/upload")
-REPORT_URL       = SERVER_URL.rsplit("/upload", 1)[0] + "/camera/report"
+BASE_URL         = SERVER_URL.rsplit("/upload", 1)[0]
+REPORT_URL       = BASE_URL + "/camera/report"
+LIVE_FRAME_URL   = BASE_URL + "/live/frame"
 API_KEY          = _env("DISH_API_KEY", "")
 CAMERA_INDEX     = int(_env("CAMERA_INDEX", "0"))
 
@@ -255,6 +257,29 @@ def detect_motion(frame, bgsub, kernel, motion_thresh):
 
 # -- main --
 
+def post_live_frame(frame, quality=55):
+    """
+    Push one frame for live view.
+
+    Encoded harder than a detection frame: this is a preview on a Pi 3B+
+    pushing several frames a second over wifi, so bytes matter more than
+    fidelity. Returns whether the server still wants frames.
+    """
+    try:
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            return False
+        r = _get_session().post(
+            LIVE_FRAME_URL,
+            files={"frame": ("live.jpg", io.BytesIO(buf.tobytes()), "image/jpeg")},
+            timeout=5)
+        r.raise_for_status()
+        return bool(r.json().get("keep_streaming"))
+    except Exception as e:
+        log.debug("live frame failed: %s", e)
+        return False
+
+
 def post_health(camera, trigger):
     """
     Tell the server how the edge node is doing.
@@ -267,9 +292,12 @@ def post_health(camera, trigger):
         payload = dict(camera.stats())
         payload.update(trigger.stats())
         payload["motion_state"] = trigger.state
-        _get_session().post(REPORT_URL, json=payload, timeout=10)
+        r = _get_session().post(REPORT_URL, json=payload, timeout=10)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
         log.debug("health report failed: %s", e)
+    return {}
 
 
 def main():
@@ -296,6 +324,9 @@ def main():
     last_heartbeat = 0.0
     last_health = 0.0
     last_frame = None
+    live_until = 0.0
+    live_fps = 4.0
+    last_live_push = 0.0
     srv_state = "CLEAR"
     consec_clear = 0
     monitoring_until = 0.0
@@ -328,8 +359,21 @@ def main():
                 video_buf.maybe_add(frame, now)
 
             if now - last_health >= HEALTH_INTERVAL_SEC:
-                post_health(cam, trigger)
+                reply = post_health(cam, trigger)
                 last_health = now
+                if reply.get("live_wanted"):
+                    live_until = now + float(reply.get("lease_remaining", 0) or 0)
+                    live_fps = float(reply.get("live_fps", 4) or 4)
+                    log.info("live view requested, streaming at %.0f fps for %.0fs",
+                             live_fps, live_until - now)
+
+            # live view: push frames while the lease holds. The server replies
+            # with keep_streaming so a closed tab stops this promptly rather
+            # than waiting out the whole lease.
+            if now < live_until and (now - last_live_push) >= (1.0 / max(1.0, live_fps)):
+                last_live_push = now
+                if not post_live_frame(frame):
+                    live_until = 0.0
 
             if frame_counter % PROCESS_EVERY_N == 0:
                 event = trigger.update(frame)
