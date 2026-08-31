@@ -244,6 +244,42 @@ def _forward_auth_ok(request: Request) -> bool:
     return any(addr in net for net in FORWARD_AUTH_NETS)
 
 _AUTH_EXEMPT_EXACT = {"/healthz", "/readyz", "/metrics"}
+
+# Paths that must never be served to a request that arrived from the internet,
+# regardless of how well authenticated it is. Roommate photos are pictures of
+# people who did not sign up to be on a public host, and "it is behind SSO" is
+# not the same promise as "it never leaves the flat". These are reachable only
+# over the tailnet or from inside the cluster network.
+LOCAL_ONLY_PATTERNS = ("/people/", "/thumbs/", "/videos/")
+PUBLIC_HOSTNAMES = {
+    h.strip().lower()
+    for h in os.environ.get("PUBLIC_HOSTNAMES", "sink.colewiz.dev").split(",")
+    if h.strip()
+}
+
+
+def _is_local_only_path(path: str) -> bool:
+    # /people (the roster: names and counts) is fine; a photo is not
+    if path.startswith("/people/") and path.endswith("/photo"):
+        return True
+    return path.startswith(("/thumbs/", "/videos/"))
+
+
+def _came_from_the_internet(request: Request) -> bool:
+    """
+    True when the request arrived through the Cloudflare tunnel.
+
+    Two independent signals, because either alone can be spoofed by something
+    already inside the cluster: the Authentik outpost stamps its own headers on
+    anything it proxies, and the public Host header only appears on requests
+    that resolved the public name.
+    """
+    if request.headers.get(FORWARD_AUTH_HEADER, ""):
+        return True
+    host = (request.headers.get("host") or "").split(":")[0].lower()
+    if host in PUBLIC_HOSTNAMES:
+        return True
+    return bool(request.headers.get("cf-ray") or request.headers.get("cf-connecting-ip"))
 _AUTH_EXEMPT_PREFIX = ("/upload", "/camera/", "/live/frame")
 
 
@@ -266,6 +302,13 @@ async def dashboard_auth(request: Request, call_next):
     path = request.url.path
     if path in _AUTH_EXEMPT_EXACT or path.startswith(_AUTH_EXEMPT_PREFIX):
         return await call_next(request)
+
+    if _is_local_only_path(path) and _came_from_the_internet(request):
+        log.info("refused %s from the public route", path)
+        return JSONResponse(
+            {"error": "not available over the internet",
+             "detail": "photos and clips are served only on the local network"},
+            status_code=403)
 
     if _forward_auth_ok(request):
         return await call_next(request)
@@ -768,6 +811,7 @@ def _dashboard_payload():
             "have_frame": LIVE["frame"] is not None,
             "frame_age": round(time.time() - LIVE["frame_at"], 1) if LIVE["frame_at"] else None,
         },
+        "media_local_only": True,
         "events": list(EVENTS),
         "consensus": st.get("consensus"),
     }

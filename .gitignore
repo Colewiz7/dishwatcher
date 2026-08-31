@@ -6,6 +6,10 @@ data/
 images/
 videos/
 thumbs/
+# roommate photos. never commit these.
+people/
+people.json
+clip_tags.json
 reference.jpg
 roi.json
 config.json

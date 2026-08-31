@@ -419,6 +419,15 @@ function renderRoster(list, counts) {
       img.className = 'avatar';
       img.src = p.photo_url;
       img.alt = p.name;
+      // photos are refused over the public route on purpose; fall back to
+      // initials rather than showing a broken image
+      img.onerror = () => {
+        const ph = document.createElement('div');
+        ph.className = 'avatar placeholder';
+        ph.textContent = initials(p.name);
+        ph.title = 'photo is only shown on the local network';
+        img.replaceWith(ph);
+      };
       row.appendChild(img);
     } else {
       const ph = document.createElement('div');
@@ -484,6 +493,9 @@ function pickPhoto(pid) {
 
 function renderClips(clips) {
   const el = $('clips');
+  // over the tunnel the video bytes are refused, so say why instead of
+  // rendering a row of dead players
+  const offsite = location.protocol === 'https:' && !location.hostname.startsWith('100.');
   if (!clips.length) {
     if (el.dataset.state !== 'empty') {
       el.innerHTML = '<div class="empty">No clips yet. One is recorded when somebody walks away from the sink.</div>';
@@ -501,12 +513,25 @@ function renderClips(clips) {
     const card = document.createElement('div');
     card.className = 'clip';
 
-    const vid = document.createElement('video');
-    vid.controls = true;
-    vid.preload = 'none';
-    if (c.thumb_url) vid.poster = c.thumb_url;
-    vid.src = c.url;
-    card.appendChild(vid);
+    if (offsite) {
+      const ph = document.createElement('div');
+      ph.className = 'poster';
+      ph.style.display = 'grid';
+      ph.style.placeItems = 'center';
+      ph.style.padding = '0 18px';
+      ph.style.textAlign = 'center';
+      ph.style.fontSize = '.78rem';
+      ph.style.color = 'var(--on-surface-variant)';
+      ph.textContent = 'Playable on the local network only';
+      card.appendChild(ph);
+    } else {
+      const vid = document.createElement('video');
+      vid.controls = true;
+      vid.preload = 'none';
+      if (c.thumb_url) vid.poster = c.thumb_url;
+      vid.src = c.url;
+      card.appendChild(vid);
+    }
 
     const meta = document.createElement('div');
     meta.className = 'meta';
