@@ -4,6 +4,7 @@
 
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
 import os
@@ -168,6 +169,33 @@ DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "cole")
 TRUST_FORWARD_AUTH = os.environ.get("TRUST_FORWARD_AUTH", "false").lower() == "true"
 FORWARD_AUTH_HEADER = "x-authentik-username"
 
+# The header is only believed from inside the cluster. Authentik proxies from a
+# pod, so those requests arrive from the pod CIDR; the NodePort preserves the
+# real client address, so a tailnet client shows up as 100.x and cannot get in
+# by simply setting the header itself. Without this check the header is a
+# complete auth bypass for anyone who can reach the NodePort.
+FORWARD_AUTH_NETS = [
+    ipaddress.ip_network(n.strip())
+    for n in os.environ.get("FORWARD_AUTH_NETWORKS", "10.42.0.0/16,10.43.0.0/16").split(",")
+    if n.strip()
+]
+
+
+def _forward_auth_ok(request: Request) -> bool:
+    """True only for an authenticated request that actually came via the proxy."""
+    if not TRUST_FORWARD_AUTH:
+        return False
+    if not request.headers.get(FORWARD_AUTH_HEADER, ""):
+        return False
+    client = request.client.host if request.client else None
+    if not client:
+        return False
+    try:
+        addr = ipaddress.ip_address(client)
+    except ValueError:
+        return False
+    return any(addr in net for net in FORWARD_AUTH_NETS)
+
 _AUTH_EXEMPT_EXACT = {"/healthz", "/readyz", "/metrics"}
 _AUTH_EXEMPT_PREFIX = ("/upload", "/camera/", "/live/frame")
 
@@ -181,7 +209,7 @@ async def dashboard_auth(request: Request, call_next):
         path = request.url.path
         if path in _AUTH_EXEMPT_EXACT or path.startswith(_AUTH_EXEMPT_PREFIX):
             return await call_next(request)
-        if TRUST_FORWARD_AUTH and request.headers.get(FORWARD_AUTH_HEADER, ""):
+        if _forward_auth_ok(request):
             return await call_next(request)
         return JSONResponse(
             {"error": "DASHBOARD_PASSWORD is not set, so the dashboard is disabled",
@@ -192,10 +220,8 @@ async def dashboard_auth(request: Request, call_next):
     if path in _AUTH_EXEMPT_EXACT or path.startswith(_AUTH_EXEMPT_PREFIX):
         return await call_next(request)
 
-    if TRUST_FORWARD_AUTH:
-        who = request.headers.get(FORWARD_AUTH_HEADER, "")
-        if who:
-            return await call_next(request)
+    if _forward_auth_ok(request):
+        return await call_next(request)
 
     header = request.headers.get("authorization", "")
     if header.startswith("Basic "):
