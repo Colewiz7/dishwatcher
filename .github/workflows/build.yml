@@ -50,6 +50,19 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=sha,format=short
+      # Build once without pushing and import the app inside it. The unit
+      # tests run from the source tree, so they cannot catch a module that
+      # exists in git but was never copied into the image. That shipped a
+      # crash-looping image once.
+      - name: the image must actually start
+        uses: docker/build-push-action@v6
+        with:
+          context: ./server
+          load: true
+          push: false
+          tags: dishwatcher:ci
+      - run: docker run --rm dishwatcher:ci python -c "import server; print(len(server.app.routes), 'routes')"
+
       - uses: docker/build-push-action@v6
         with:
           context: ./server

@@ -27,8 +27,11 @@ RUN pip install --no-cache-dir -r requirements.txt \
          && python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"; \
        fi
 
-COPY server.py detector.py calibration.py metrics.py storage.py \
-     state_machine.py notifier.py config.py ./
+# Copy every module rather than listing them. The explicit list silently
+# omitted people.py when it was added, and the image crash-looped on
+# ModuleNotFoundError with the app down, because the tests run from the source
+# tree and never exercise the image's file set.
+COPY *.py ./
 COPY static/ ./static/
 
 RUN mkdir -p /app/data /app/data/images /app/data/videos
