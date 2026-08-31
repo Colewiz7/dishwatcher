@@ -182,24 +182,35 @@ async def healthz():
 @app.get("/readyz")
 async def readyz():
     """
-    Readiness, and it is deliberately strict: an uncalibrated detector is NOT
-    ready. v1's whole failure was a process that looked healthy while detection
-    was disabled, so here that state fails the probe and keeps k8s/Argo honest.
+    Readiness means "can serve traffic", NOT "is calibrated".
+
+    Gating readiness on calibration is tempting, because an uncalibrated
+    detector is the exact v1 failure. But a Service drops NotReady pods from
+    its endpoints, so a strict probe would make the dashboard unreachable and
+    the dashboard is where you calibrate. It would deadlock on first deploy.
+
+    So calibration is surfaced everywhere it can be seen without blocking the
+    fix: a WARNING at startup, dishwatcher_calibration_valid in /metrics with an
+    alert rule on it, a banner across the top of the dashboard, and a 409 on
+    every upload. The one thing it must never be again is invisible.
     """
     state = calib.state()
-    checks = {
-        "calibration_valid": state.valid,
-        "self_checks": all(c["ok"] for c in SELF_CHECKS.values()) if SELF_CHECKS else False,
-        "camera_seen": CAMERA["seen"],
-    }
-    # camera_seen is informational: a fresh deploy has not heard from the Pi yet
-    # and should still be able to come up so you can calibrate from the UI.
-    ready = checks["calibration_valid"] and checks["self_checks"]
     metrics.gauge("dishwatcher_calibration_valid", 1 if state.valid else 0)
+
+    can_serve = STATIC_DIR.is_dir()
     return JSONResponse(
-        {"ready": ready, "checks": checks, "calibration": state.as_dict(),
-         "self_checks": SELF_CHECKS},
-        status_code=200 if ready else 503,
+        {
+            "ready": can_serve,
+            "calibrated": state.valid,
+            "calibration": state.as_dict(),
+            "checks": {
+                "can_serve": can_serve,
+                "camera_seen": CAMERA["seen"],
+                "calibration_valid": state.valid,
+            },
+            "self_checks": SELF_CHECKS,
+        },
+        status_code=200 if can_serve else 503,
     )
 
 
