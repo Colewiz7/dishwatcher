@@ -28,8 +28,15 @@ T_LOW = float(os.environ.get("MOTION_EXIT_FRACTION", "0.008"))
 ENTER_FRAMES = int(os.environ.get("MOTION_ENTER_FRAMES", "3"))
 EXIT_FRAMES = int(os.environ.get("MOTION_EXIT_FRAMES", "8"))
 # minimum blob size in pixels, kills speckle
+# in pixels at the DOWNSCALED working size, not the capture size
 MIN_BLOB_AREA = int(os.environ.get("MOTION_MIN_BLOB_AREA", "120"))
 COOLDOWN_SEC = float(os.environ.get("MOTION_COOLDOWN_SEC", "20"))
+# Downscale before MOG2. Frames are 1280x720 now, and running background
+# subtraction at that size saturated the Pi 3B+ (measured 64% of a core,
+# enough to touch the soft thermal limit). Motion does not need the detail:
+# v1 used 320x240 for exactly this reason.
+MOTION_W = int(os.environ.get("MOTION_WIDTH", "320"))
+MOTION_H = int(os.environ.get("MOTION_HEIGHT", "240"))
 
 IDLE, MOTION = "idle", "motion"
 
@@ -55,6 +62,10 @@ class MotionTrigger:
         if self.roi:
             x1, y1, x2, y2 = self.roi
             img = frame[max(0, y1):y2, max(0, x1):x2]
+
+        # downscale first; this is the difference between idling and pinning a core
+        if img.shape[1] > MOTION_W:
+            img = cv2.resize(img, (MOTION_W, MOTION_H), interpolation=cv2.INTER_NEAREST)
 
         mask = self._bg.apply(img)
         # MOG2 marks shadows as 127; only 255 is real foreground.
