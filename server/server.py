@@ -3,9 +3,11 @@
 # uvicorn server:app --host 0.0.0.0 --port 8000
 
 import asyncio
+import base64
 import json
 import logging
 import os
+import secrets
 import time
 from datetime import datetime
 from pathlib import Path
@@ -138,6 +140,56 @@ broadcaster = EventBroadcaster()
 app = FastAPI(title="Dish Watcher", version="5.1.0")
 STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# -- dashboard auth --
+#
+# This app is reachable at sink.colewiz.dev, and the dashboard shows blame
+# clips: video of people inside the flat. Unlike the other tunnel routes it
+# does not sit behind Authentik, so it authenticates itself.
+#
+# Exempt: /healthz and /readyz (kubelet probes), /metrics (Prometheus scrapes
+# in-cluster), and the camera endpoints, which carry their own API key. A
+# browser hitting anything else needs the password.
+
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
+DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "cole")
+
+_AUTH_EXEMPT_EXACT = {"/healthz", "/readyz", "/metrics"}
+_AUTH_EXEMPT_PREFIX = ("/upload", "/camera/", "/live/frame")
+
+
+@app.middleware("http")
+async def dashboard_auth(request: Request, call_next):
+    if not DASHBOARD_PASSWORD:
+        # No password configured: fail closed for anything that is not a probe,
+        # rather than silently serving the flat to the internet. Being loudly
+        # broken beats being quietly open; that is the lesson from v1.
+        path = request.url.path
+        if path in _AUTH_EXEMPT_EXACT or path.startswith(_AUTH_EXEMPT_PREFIX):
+            return await call_next(request)
+        return JSONResponse(
+            {"error": "DASHBOARD_PASSWORD is not set, so the dashboard is disabled",
+             "fix": "set DASHBOARD_PASSWORD in the dishwatcher-secrets secret"},
+            status_code=503)
+
+    path = request.url.path
+    if path in _AUTH_EXEMPT_EXACT or path.startswith(_AUTH_EXEMPT_PREFIX):
+        return await call_next(request)
+
+    header = request.headers.get("authorization", "")
+    if header.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(header[6:]).decode("utf-8", "replace")
+            user, _, password = decoded.partition(":")
+            # constant time, so the password cannot be recovered by timing
+            if (secrets.compare_digest(user, DASHBOARD_USER)
+                    and secrets.compare_digest(password, DASHBOARD_PASSWORD)):
+                return await call_next(request)
+        except Exception:
+            pass
+
+    return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="dishwatcher"'})
 
 
 def _check_api_key(key):
@@ -604,11 +656,27 @@ async def set_reference(
 
 
 @app.get("/admin/reference.jpg")
-async def get_reference():
+@app.get("/calibration/reference.jpg")
+async def get_reference(roi_only: bool = Query(False)):
+    """
+    The stored reference.
+
+    roi_only crops to the sink and upscales it, which is the view that actually
+    answers "is my reference clean?". A fork sitting in a basin is invisible at
+    full frame and completely obvious at 3x, and a reference with a fork in it
+    silently teaches the system that the fork is normal.
+    """
     ref = calib.reference
     if ref is None:
         raise HTTPException(404, "no reference")
-    _, buf = cv2.imencode(".jpg", ref, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    img = ref
+    if roi_only:
+        roi = (calib.roi or {}).get("sink")
+        if roi:
+            img = detector.crop_roi(ref, roi)
+            if img.size:
+                img = cv2.resize(img, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])
     return Response(content=buf.tobytes(), media_type="image/jpeg")
 
 

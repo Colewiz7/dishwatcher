@@ -299,3 +299,14 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 }
 .live-badge[hidden] { display: none; }
 #live[hidden], #frame[hidden] { display: none; }
+
+
+/* ---------- reference pair ---------- */
+
+.refgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--gutter);
+}
+.refimg { aspect-ratio: auto; }
+@media (max-width: 620px) { .refgrid { grid-template-columns: 1fr; } }

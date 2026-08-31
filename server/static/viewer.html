@@ -98,6 +98,20 @@
     <div class="stale" id="frame-age"></div>
   </div>
 
+  <!-- what the detector thinks "clean" looks like -->
+  <div class="card wide">
+    <h2>Clean reference</h2>
+    <p class="stale" style="text-align:left;padding:0 0 14px">
+      This is what the sink is compared against. Anything left in here is
+      treated as normal forever, so check it before you trust a result.
+    </p>
+    <div class="refgrid">
+      <img class="frame refimg" id="ref-full" alt="stored reference frame">
+      <img class="frame refimg" id="ref-roi" alt="sink area of the reference, magnified">
+    </div>
+    <div class="stale" id="ref-note"></div>
+  </div>
+
   <!-- events -->
   <div class="card wide">
     <h2>Recent events</h2>

@@ -143,6 +143,23 @@ function render(d) {
   $('frame-age').textContent = d.latest_frame_age_seconds !== undefined && d.latest_frame_age_seconds !== null
     ? 'captured ' + humanDuration(d.latest_frame_age_seconds) + ' ago' : '';
 
+  // the reference, so a bad calibration is visible instead of implicit
+  if (cal.valid) {
+    const stamp = cal.reference_shape ? cal.reference_shape.join('x') : '';
+    const full = $('ref-full'), roi = $('ref-roi');
+    if (full.dataset.stamp !== stamp) {
+      full.dataset.stamp = stamp;
+      full.src = '/calibration/reference.jpg?t=' + Date.now();
+      roi.src = '/calibration/reference.jpg?roi_only=1&t=' + Date.now();
+    }
+    $('ref-note').textContent = cal.roi && cal.roi.sink
+      ? 'sink area ' + cal.roi.sink.join(', ') : '';
+  } else {
+    $('ref-full').removeAttribute('src');
+    $('ref-roi').removeAttribute('src');
+    $('ref-note').textContent = 'no reference set';
+  }
+
   renderEvents(d.events || []);
 
   lastGoodAt = Date.now();
