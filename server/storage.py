@@ -244,7 +244,7 @@ def enforce_retention(clip_days, image_days):
     not just a disk one. Returns a summary for logging and metrics.
     """
     now = time.time()
-    removed = {"clips": 0, "images": 0, "bytes": 0}
+    removed = {"clips": 0, "images": 0, "bytes": 0, "removed_clips": []}
 
     for directory, days, key in ((_vid_dir, clip_days, "clips"),
                                  (_img_dir, image_days, "images"),
@@ -263,6 +263,8 @@ def enforce_retention(clip_days, image_days):
                 if st.st_mtime < cutoff:
                     size = st.st_size
                     f.unlink()
+                    if key == "clips":
+                        removed["removed_clips"].append(f.name)
                     removed[key] += 1
                     removed["bytes"] += size
             except OSError as e:

@@ -310,3 +310,92 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 }
 .refimg { aspect-ratio: auto; }
 @media (max-width: 620px) { .refgrid { grid-template-columns: 1fr; } }
+
+
+/* ---------- roster ---------- */
+
+.roster { display: flex; flex-wrap: wrap; gap: var(--gutter); }
+.person {
+  background: var(--surface-container-high);
+  border-radius: var(--radius-inner);
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 200px;
+}
+.avatar {
+  width: 46px; height: 46px;
+  border-radius: var(--radius-pill);
+  object-fit: cover;
+  background: var(--surface-container-highest);
+  flex: none;
+}
+.avatar.placeholder {
+  display: grid;
+  place-items: center;
+  font-size: 1.05rem;
+  font-weight: var(--weight-medium);
+  color: var(--on-surface-variant);
+}
+.person .who { flex: 1; min-width: 0; }
+.person .nm {
+  font-weight: var(--weight-medium);
+  font-size: .92rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.person .ct { font-size: .74rem; color: var(--on-surface-variant); }
+.person .acts { display: flex; gap: 6px; }
+.iconbtn {
+  padding: 6px 11px;
+  font-size: .72rem;
+  background: var(--surface-container-highest);
+}
+
+.text-in {
+  font-family: var(--font);
+  font-size: .85rem;
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: 10px 16px;
+  background: var(--surface-container-high);
+  color: var(--on-surface);
+  min-width: 180px;
+}
+.text-in::placeholder { color: var(--on-surface-variant); }
+
+/* ---------- clips ---------- */
+
+.clips {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--gutter);
+}
+.clip {
+  background: var(--surface-container-high);
+  border-radius: var(--radius-inner);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.clip video, .clip .poster {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  background: var(--surface-container-highest);
+  display: block;
+}
+.clip .meta { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+.clip .when { font-size: .78rem; color: var(--on-surface-variant); }
+.clip .tagrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.clip select {
+  font-family: var(--font);
+  font-size: .76rem;
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: 7px 12px;
+  background: var(--surface-container-lowest);
+  color: var(--on-surface);
+  flex: 1;
+  min-width: 120px;
+}

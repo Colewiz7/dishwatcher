@@ -390,6 +390,211 @@ $('live').addEventListener('load', () => {
   $('live-badge').className = 'pill pill-bad live-badge';
 });
 
+/* ---------- roommates + blame clips ---------- */
+
+let peopleCache = [];
+
+function initials(name) {
+  return name.trim().split(/\s+/).slice(0, 2).map(w => w[0] || '').join('').toUpperCase();
+}
+
+function renderRoster(list, counts) {
+  peopleCache = list;
+  const el = $('roster');
+  const sig = JSON.stringify([list, counts]);
+  if (el.dataset.sig === sig) return;
+  el.dataset.sig = sig;
+
+  if (!list.length) {
+    el.innerHTML = '<div class="empty">Nobody added yet. Add a roommate to start tagging clips.</div>';
+    return;
+  }
+  el.innerHTML = '';
+  for (const p of list) {
+    const row = document.createElement('div');
+    row.className = 'person';
+
+    if (p.photo_url) {
+      const img = document.createElement('img');
+      img.className = 'avatar';
+      img.src = p.photo_url;
+      img.alt = p.name;
+      row.appendChild(img);
+    } else {
+      const ph = document.createElement('div');
+      ph.className = 'avatar placeholder';
+      ph.textContent = initials(p.name);
+      row.appendChild(ph);
+    }
+
+    const who = document.createElement('div');
+    who.className = 'who';
+    const nm = document.createElement('div');
+    nm.className = 'nm';
+    nm.textContent = p.name;
+    const ct = document.createElement('div');
+    ct.className = 'ct';
+    const n = counts[p.name] || 0;
+    // say it in words; "0 clips" reads worse than "nothing pinned on them"
+    ct.textContent = n === 0 ? 'nothing pinned on them' : (n === 1 ? '1 clip' : n + ' clips');
+    who.appendChild(nm); who.appendChild(ct);
+    row.appendChild(who);
+
+    const acts = document.createElement('div');
+    acts.className = 'acts';
+
+    const photoBtn = document.createElement('button');
+    photoBtn.className = 'iconbtn';
+    photoBtn.textContent = p.photo_url ? 'change photo' : 'add photo';
+    photoBtn.onclick = () => pickPhoto(p.id);
+    acts.appendChild(photoBtn);
+
+    const del = document.createElement('button');
+    del.className = 'iconbtn';
+    del.textContent = 'remove';
+    del.onclick = async () => {
+      if (!confirm('Remove ' + p.name + '? Their clip tags go too.')) return;
+      await fetch('/people/' + p.id, { method: 'DELETE', credentials: 'same-origin' });
+      loadPeople(); loadClips();
+    };
+    acts.appendChild(del);
+
+    row.appendChild(acts);
+    el.appendChild(row);
+  }
+}
+
+function pickPhoto(pid) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.onchange = async () => {
+    if (!input.files || !input.files[0]) return;
+    const fd = new FormData();
+    fd.append('photo', input.files[0]);
+    try {
+      const r = await fetch('/people/' + pid + '/photo', {
+        method: 'POST', body: fd, credentials: 'same-origin' });
+      if (!r.ok) throw new Error(await r.text());
+      loadPeople();
+    } catch (e) { alert('Could not upload the photo: ' + e.message); }
+  };
+  input.click();
+}
+
+function renderClips(clips) {
+  const el = $('clips');
+  if (!clips.length) {
+    if (el.dataset.state !== 'empty') {
+      el.innerHTML = '<div class="empty">No clips yet. One is recorded when somebody walks away from the sink.</div>';
+      el.dataset.state = 'empty';
+    }
+    return;
+  }
+  const sig = JSON.stringify(clips.map(c => [c.url, c.tag && c.tag.person_id]));
+  if (el.dataset.sig === sig) return;
+  el.dataset.sig = sig;
+  el.dataset.state = 'list';
+
+  el.innerHTML = '';
+  for (const c of clips) {
+    const card = document.createElement('div');
+    card.className = 'clip';
+
+    const vid = document.createElement('video');
+    vid.controls = true;
+    vid.preload = 'none';
+    if (c.thumb_url) vid.poster = c.thumb_url;
+    vid.src = c.url;
+    card.appendChild(vid);
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+
+    const when = document.createElement('div');
+    when.className = 'when';
+    when.textContent = c.timestamp || c.filename || '';
+    meta.appendChild(when);
+
+    const row = document.createElement('div');
+    row.className = 'tagrow';
+
+    const sel = document.createElement('select');
+    const none = document.createElement('option');
+    none.value = ''; none.textContent = 'nobody tagged';
+    sel.appendChild(none);
+    for (const p of peopleCache) {
+      const o = document.createElement('option');
+      o.value = p.id; o.textContent = p.name;
+      if (c.tag && c.tag.person_id === p.id) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.onchange = async () => {
+      const name = (c.filename || c.url.split('/').pop());
+      try {
+        await fetch('/clips/' + encodeURIComponent(name) + '/tag', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ person_id: sel.value || null }),
+        });
+        loadClips(); loadPeople();
+      } catch (e) { alert('Could not tag the clip: ' + e.message); }
+    };
+    row.appendChild(sel);
+
+    // a badge only when it is tagged; an untagged clip says so in the dropdown
+    if (c.tag) {
+      const p = document.createElement('span');
+      pill(p, 'warn', c.tag.name);
+      row.appendChild(p);
+    }
+
+    meta.appendChild(row);
+    card.appendChild(meta);
+    el.appendChild(card);
+  }
+}
+
+async function loadPeople() {
+  try {
+    const r = await fetch('/people', { credentials: 'same-origin' });
+    if (!r.ok) return;
+    const d = await r.json();
+    renderRoster(d.people || [], d.counts || {});
+  } catch (e) { /* leave the last render */ }
+}
+
+async function loadClips() {
+  try {
+    const r = await fetch('/clips', { credentials: 'same-origin' });
+    if (!r.ok) return;
+    const d = await r.json();
+    renderClips(d.clips || []);
+  } catch (e) { /* leave the last render */ }
+}
+
+$('add-person').addEventListener('click', async () => {
+  const input = $('new-name');
+  const name = input.value.trim();
+  if (!name) return;
+  try {
+    const r = await fetch('/people', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ name }),
+    });
+    if (!r.ok) throw new Error((await r.text()) || r.statusText);
+    input.value = '';
+    loadPeople(); loadClips();
+  } catch (e) { alert('Could not add them: ' + e.message); }
+});
+
+$('new-name').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') $('add-person').click();
+});
+
 /* ---------- boot: cache first ---------- */
 
 (function boot() {
@@ -398,5 +603,9 @@ $('live').addEventListener('load', () => {
     if (cached) { render(JSON.parse(cached)); pill($('conn'), 'mute', 'cached'); }
   } catch (e) { /* ignore */ }
   connect();
+  loadPeople();
+  loadClips();
+  // clips only change when somebody walks past the sink, so this is unhurried
+  setInterval(loadClips, 30000);
   setInterval(() => { if (lastGoodAt && Date.now() - lastGoodAt > 15000) markStale(); }, 5000);
 })();

@@ -26,6 +26,7 @@ import config
 import detector
 import metrics
 import notifier
+import people
 import state_machine
 import storage
 
@@ -47,6 +48,7 @@ log = logging.getLogger("dishwatcher.server")
 os.environ.setdefault("DATA_DIR", SAVE_DIR)
 config.init(SAVE_DIR)
 storage.configure(SAVE_DIR)
+people.configure(SAVE_DIR)
 sm = state_machine.DishStateMachine()
 
 # Calibration is a first-class object now. v1 hid it inside detector.py behind a
@@ -84,6 +86,7 @@ run_self_checks()
 CAMERA = {"seen": False, "last_report": None, "stats": {}}
 
 RETENTION_INTERVAL_SEC = float(os.environ.get("RETENTION_INTERVAL_SEC", "3600"))
+SSE_HEARTBEAT_SEC = float(os.environ.get("SSE_HEARTBEAT_SEC", "2.0"))
 
 
 async def _retention_loop():
@@ -103,6 +106,8 @@ async def _retention_loop():
                 config.get("image_retention_days", 30),
             )
             metrics.inc("dishwatcher_clips_deleted_total", removed.get("clips", 0))
+            for gone in removed.get("removed_clips", []):
+                people.forget_clip(gone)
             metrics.gauge("dishwatcher_oldest_clip_age_seconds",
                           storage.oldest_clip_age_seconds())
             metrics.gauge("dishwatcher_storage_bytes", storage.total_bytes())
@@ -454,6 +459,96 @@ async def live_mjpeg(request: Request):
                  "X-Accel-Buffering": "no"})
 
 
+@app.get("/clips")
+async def list_clips(limit: int = Query(40, ge=1, le=200)):
+    """
+    Saved blame clips, newest first, with whoever they are attributed to.
+
+    The clips were being recorded from the start and there was no way to watch
+    one, so they were evidence nobody could read.
+    """
+    out = []
+    for v in storage.list_videos(limit=limit):
+        name = v.get("filename") or v.get("name")
+        if not name:
+            continue
+        out.append({
+            **v,
+            "url": f"/videos/{name}",
+            "thumb_url": f"/thumbs/{v['thumb']}" if v.get("thumb") else None,
+            "tag": people.tag_of(name),
+        })
+    return JSONResponse({"clips": out, "counts": people.counts()})
+
+
+@app.get("/thumbs/{filename}")
+async def get_thumb(filename: str):
+    path = storage.get_thumb_path(Path(filename).name)
+    if not path or not Path(path).is_file():
+        raise HTTPException(404, "no such thumbnail")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/people")
+async def get_people():
+    return JSONResponse({"people": people.list_people(), "counts": people.counts()})
+
+
+@app.post("/people")
+async def create_person(request: Request):
+    body = await request.json()
+    try:
+        pid = people.add_person(body.get("name"))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return JSONResponse({"id": pid, "people": people.list_people()})
+
+
+@app.post("/people/{pid}/photo")
+async def upload_photo(pid: str, photo: UploadFile = File(...)):
+    raw = await photo.read()
+    try:
+        people.set_photo(pid, raw, photo.content_type)
+    except KeyError:
+        raise HTTPException(404, "no such person")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return JSONResponse({"ok": True, "people": people.list_people()})
+
+
+@app.get("/people/{pid}/photo")
+async def get_photo(pid: str):
+    path = people.photo_path(pid)
+    if not path:
+        raise HTTPException(404, "no photo")
+    media = "image/png" if path.suffix == ".png" else "image/jpeg"
+    return FileResponse(str(path), media_type=media)
+
+
+@app.delete("/people/{pid}")
+async def delete_person(pid: str):
+    try:
+        people.remove_person(pid)
+    except KeyError:
+        raise HTTPException(404, "no such person")
+    return JSONResponse({"ok": True, "people": people.list_people()})
+
+
+@app.post("/clips/{filename}/tag")
+async def tag_clip(filename: str, request: Request):
+    """Attribute a clip to someone, or clear it with person_id null."""
+    body = await request.json()
+    pid = body.get("person_id")
+    try:
+        tag = people.tag_clip(Path(filename).name, pid)
+    except KeyError:
+        raise HTTPException(404, "no such person")
+    who = people.name_of(pid) if pid else None
+    record_event("info", f"clip attributed to {who}" if who else "clip attribution cleared")
+    await broadcaster.publish("clips", {"filename": filename})
+    return JSONResponse({"ok": True, "tag": tag})
+
+
 @app.get("/images/{filename}")
 async def get_image(filename: str):
     # basename only: never let a path component escape the data directory
@@ -691,8 +786,12 @@ async def status_stream(request: Request):
         q = broadcaster.subscribe()
         try:
             while True:
+                # Push on an event, or every couple of seconds regardless, so
+                # the counters and timers keep moving. This used to wait 15s,
+                # which made a working dashboard look frozen. The payload is
+                # small and takes about 3ms to build, so the cost is noise.
                 try:
-                    await asyncio.wait_for(q.get(), timeout=15.0)
+                    await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT_SEC)
                 except asyncio.TimeoutError:
                     pass
                 yield f"data: {json.dumps(_dashboard_payload(), default=str)}\n\n"
