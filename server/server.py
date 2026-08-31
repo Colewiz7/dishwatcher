@@ -155,6 +155,19 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
 DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "cole")
 
+# When Authentik proxies this app it has already authenticated the user and
+# injects X-authentik-username. Accepting that avoids a second password prompt
+# on top of the SSO login.
+#
+# The header is only trusted when this is on, and it is on because the public
+# route reaches the app exclusively through the Authentik outpost. The other
+# way in is the NodePort, which is reachable only from the internal bridge and
+# the tailnet, both already authenticated; anyone there could forge the header,
+# so this is not a substitute for the tailnet being trusted. Basic auth stays
+# as the fallback for that path.
+TRUST_FORWARD_AUTH = os.environ.get("TRUST_FORWARD_AUTH", "false").lower() == "true"
+FORWARD_AUTH_HEADER = "x-authentik-username"
+
 _AUTH_EXEMPT_EXACT = {"/healthz", "/readyz", "/metrics"}
 _AUTH_EXEMPT_PREFIX = ("/upload", "/camera/", "/live/frame")
 
@@ -168,6 +181,8 @@ async def dashboard_auth(request: Request, call_next):
         path = request.url.path
         if path in _AUTH_EXEMPT_EXACT or path.startswith(_AUTH_EXEMPT_PREFIX):
             return await call_next(request)
+        if TRUST_FORWARD_AUTH and request.headers.get(FORWARD_AUTH_HEADER, ""):
+            return await call_next(request)
         return JSONResponse(
             {"error": "DASHBOARD_PASSWORD is not set, so the dashboard is disabled",
              "fix": "set DASHBOARD_PASSWORD in the dishwatcher-secrets secret"},
@@ -176,6 +191,11 @@ async def dashboard_auth(request: Request, call_next):
     path = request.url.path
     if path in _AUTH_EXEMPT_EXACT or path.startswith(_AUTH_EXEMPT_PREFIX):
         return await call_next(request)
+
+    if TRUST_FORWARD_AUTH:
+        who = request.headers.get(FORWARD_AUTH_HEADER, "")
+        if who:
+            return await call_next(request)
 
     header = request.headers.get("authorization", "")
     if header.startswith("Basic "):
