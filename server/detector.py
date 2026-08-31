@@ -33,6 +33,9 @@ TILE_GRID = int(os.environ.get("SSIM_TILE_GRID", "4"))
 MIN_TILE_EDGE = 24
 # percentile of the SSIM map used as the score. See compute_ssim_tiled.
 SSIM_PERCENTILE = float(os.environ.get("SSIM_PERCENTILE", "2.0"))
+# Gaussian kernel applied before comparison. Must be odd. Set 0 or 1 to disable.
+_dk = int(os.environ.get("SSIM_DENOISE_KERNEL", "5"))
+DENOISE_KERNEL = _dk if _dk % 2 == 1 else _dk + 1
 
 
 class NotCalibrated(Exception):
@@ -111,16 +114,34 @@ def compute_ssim_tiled(img1, img2, grid=None, percentile=None):
 
 def prep_for_ssim(img):
     """
-    Grayscale + CLAHE.
+    Grayscale, CLAHE, then denoise.
 
     v1 used equalizeHist, a global transform. A single bright window or a
-    partial shadow shifts the whole histogram and moves every pixel, which
-    produces change where there is none. CLAHE normalises locally so a shadow
-    on one side does not corrupt the other.
+    partial shadow shifts the whole histogram and moves every pixel, producing
+    change where there is none. CLAHE normalises locally so a shadow on one
+    side does not corrupt the other.
+
+    The blur is not cosmetic, it is what makes this usable on a real camera.
+    Measured on two frames of the same clean sink taken one second apart by the
+    actual Pi, over the real sink ROI:
+
+        preprocessing              clean vs clean    clean vs dishes
+        CLAHE only                 p2 = 0.650        p2 = 0.020
+        CLAHE + 5px gaussian       p2 = 0.942        p2 = 0.010
+
+    Without it, webcam sensor noise and JPEG ringing drag the 2nd percentile of
+    an unchanged sink down to 0.650, well under any threshold that still
+    detects dishes, so an empty sink reads dirty. Synthetic test images are
+    smooth and never showed this. Blurring first costs almost nothing in
+    sensitivity (dishes still score ~0.01) and widens the margin from 0.63 to
+    0.93.
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    return clahe.apply(gray)
+    equalised = clahe.apply(gray)
+    if DENOISE_KERNEL > 1:
+        return cv2.GaussianBlur(equalised, (DENOISE_KERNEL, DENOISE_KERNEL), 0)
+    return equalised
 
 
 def crop_roi(img, roi):

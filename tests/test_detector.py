@@ -171,3 +171,83 @@ def test_scores_are_not_constant(tmp_path):
                      yolo_enabled=False)["ssim_score"]
               for r in (0o0 or 30, 50, 70, 90)}
     assert len(scores) > 1, f"detector returned a constant score: {scores}"
+
+
+# -- real-camera regression --
+#
+# These use two actual captures from the Pi, one second apart, cropped to the
+# sink ROI. They exist because the failure they pin does not reproduce on
+# synthetic images at all.
+#
+# With CLAHE alone those two frames of an UNCHANGED sink scored 0.650 at the
+# 2nd percentile, below the 0.82 threshold, so an empty sink read as dirty.
+# Webcam sensor noise (measured std 4.1 between consecutive frames) and JPEG
+# ringing cause it. Smooth synthetic test images never showed it, which is
+# exactly why real frames are checked in here.
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _fixture(name):
+    img = cv2.imread(str(FIXTURES / name))
+    assert img is not None, f"missing fixture {name}"
+    return img
+
+
+def test_denoise_is_enabled_by_default():
+    """Turning this off reintroduces the real-camera false positive."""
+    import detector
+    assert detector.DENOISE_KERNEL >= 3
+    assert detector.DENOISE_KERNEL % 2 == 1, "gaussian kernel must be odd"
+
+
+def test_real_unchanged_sink_is_not_dishes():
+    """The regression. Two real captures of the same clean sink, 1s apart."""
+    a, b = _fixture("sink_a.png"), _fixture("sink_b.png")
+    score, _ = compute_ssim_tiled(prep_for_ssim(a), prep_for_ssim(b))
+    assert score >= THRESHOLD, (
+        f"two real captures of an unchanged sink scored {score:.4f}; "
+        "sensor noise is reading as dishes again")
+
+
+def test_real_sink_with_dishes_is_detected():
+    a, b = _fixture("sink_a.png"), _fixture("sink_b.png")
+    dirty = b.copy()
+    h, w = dirty.shape[:2]
+    cv2.circle(dirty, (int(w * .27), int(h * .38)), 26, (238, 240, 243), -1)
+    cv2.circle(dirty, (int(w * .60), int(h * .50)), 19, (225, 228, 232), -1)
+    score, _ = compute_ssim_tiled(prep_for_ssim(a), prep_for_ssim(dirty))
+    assert score < THRESHOLD, f"dishes in the real sink scored {score:.4f} and were missed"
+
+
+def test_real_margin_is_wide():
+    """
+    Clean and dirty must be far apart on real imagery, not merely either side of
+    the threshold. Measured on hardware the gap is about 0.93.
+    """
+    a, b = _fixture("sink_a.png"), _fixture("sink_b.png")
+    dirty = b.copy()
+    h, w = dirty.shape[:2]
+    cv2.circle(dirty, (int(w * .27), int(h * .38)), 26, (238, 240, 243), -1)
+    clean_score, _ = compute_ssim_tiled(prep_for_ssim(a), prep_for_ssim(b))
+    dirty_score, _ = compute_ssim_tiled(prep_for_ssim(a), prep_for_ssim(dirty))
+    assert clean_score - dirty_score > 0.5, (
+        f"margin too thin: clean={clean_score:.4f} dirty={dirty_score:.4f}")
+
+
+def test_denoise_off_reproduces_the_original_failure():
+    """
+    Documents the bug directly: without the blur the real clean pair falls under
+    the threshold. If this ever stops holding, the preprocessing changed.
+    """
+    import detector
+    a, b = _fixture("sink_a.png"), _fixture("sink_b.png")
+    original = detector.DENOISE_KERNEL
+    try:
+        detector.DENOISE_KERNEL = 1
+        score, _ = compute_ssim_tiled(prep_for_ssim(a), prep_for_ssim(b))
+        assert score < THRESHOLD, (
+            "expected the un-denoised real pair to false-positive, "
+            f"got {score:.4f}; the fixtures may have changed")
+    finally:
+        detector.DENOISE_KERNEL = original
