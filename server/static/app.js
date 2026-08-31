@@ -249,35 +249,63 @@ function markStale() {
   pill($('conn'), 'warn', 'updated ' + humanDuration(age) + ' ago');
 }
 
+let pollTimer = null;
+let sse = null;
+
+function startPolling(why) {
+  if (pollTimer) return;              // already polling
+  if (sse) { try { sse.close(); } catch (e) {} sse = null; }
+  console.info('falling back to polling:', why);
+  const tick = async () => {
+    try {
+      const r = await fetch('/status', { credentials: 'same-origin' });
+      if (r.ok) { render(await r.json()); pill($('conn'), 'ok', 'live'); }
+      else markStale();
+    } catch (e) { markStale(); }
+    pollTimer = setTimeout(tick, 5000);
+  };
+  tick();
+}
+
+/* Server-sent events, with a hard fallback.
+ *
+ * Behind the Authentik outpost the stream can connect and then deliver
+ * nothing, because a proxy in the path buffers it. The page then sat on
+ * skeletons forever: the old code only fell back if the EventSource
+ * constructor threw, which it does not in that case. So if no message
+ * arrives shortly after opening, give up on the stream and poll instead. */
 function connect() {
-  let es;
+  let opened = false;
+
   try {
-    es = new EventSource('/status/stream');
+    sse = new EventSource('/status/stream', { withCredentials: true });
   } catch (e) {
-    return poll();
+    return startPolling('EventSource unavailable');
   }
-  es.onmessage = (ev) => {
+
+  // if the stream is silent, it is useless however healthy it looks
+  const silenceTimer = setTimeout(() => {
+    if (!opened) startPolling('no data within 6s of connecting');
+  }, 6000);
+
+  sse.onmessage = (ev) => {
+    opened = true;
+    clearTimeout(silenceTimer);
     try {
       render(JSON.parse(ev.data));
       pill($('conn'), 'ok', 'live');
-    } catch (e) { /* keep last good render */ }
+    } catch (e) { /* keep the last good render */ }
   };
-  es.onerror = () => {
-    markStale();
-    es.close();
-    setTimeout(connect, 4000);
-  };
-}
 
-async function poll() {
-  try {
-    const r = await fetch('/status');
-    if (r.ok) {
-      render(await r.json());
-      pill($('conn'), 'ok', 'live');
-    } else markStale();
-  } catch (e) { markStale(); }
-  setTimeout(poll, 5000);
+  sse.onerror = () => {
+    clearTimeout(silenceTimer);
+    markStale();
+    try { sse.close(); } catch (e) {}
+    sse = null;
+    // a stream that errors before ever delivering is not worth retrying
+    if (opened) setTimeout(connect, 4000);
+    else startPolling('stream errored before delivering anything');
+  };
 }
 
 /* ---------- actions ---------- */

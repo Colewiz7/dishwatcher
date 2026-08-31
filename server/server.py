@@ -10,7 +10,7 @@ import logging
 import os
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -83,6 +83,38 @@ run_self_checks()
 # camera health, reported by the edge node on each upload
 CAMERA = {"seen": False, "last_report": None, "stats": {}}
 
+RETENTION_INTERVAL_SEC = float(os.environ.get("RETENTION_INTERVAL_SEC", "3600"))
+
+
+async def _retention_loop():
+    """
+    Delete media past its window, hourly.
+
+    storage.enforce_retention() existed for a while with nothing calling it,
+    which is the same shape of bug as v1's detector: code that looks like a
+    feature but never runs. The metrics below make it observable, so "retention
+    is not actually running" is visible rather than assumed.
+    """
+    while True:
+        try:
+            removed = await asyncio.to_thread(
+                storage.enforce_retention,
+                config.get("clip_retention_days", 14),
+                config.get("image_retention_days", 30),
+            )
+            metrics.inc("dishwatcher_clips_deleted_total", removed.get("clips", 0))
+            metrics.gauge("dishwatcher_oldest_clip_age_seconds",
+                          storage.oldest_clip_age_seconds())
+            metrics.gauge("dishwatcher_storage_bytes", storage.total_bytes())
+            if removed.get("clips") or removed.get("images"):
+                record_event("info",
+                             f"retention removed {removed['clips']} clips, "
+                             f"{removed['images']} frames")
+        except Exception as e:
+            log.warning("retention sweep failed: %s", e)
+        await asyncio.sleep(RETENTION_INTERVAL_SEC)
+
+
 # Last detection and a short event ring, so the dashboard has something to
 # paint immediately on load instead of a cold spinner.
 from collections import deque  # noqa: E402
@@ -104,7 +136,10 @@ LIVE_LEASE_SEC = float(os.environ.get("LIVE_LEASE_SEC", "120"))
 
 
 def record_event(kind, message):
-    EVENTS.appendleft({"at": datetime.now().isoformat(), "kind": kind, "message": message})
+    # timezone-aware, so the browser converts to the viewer's local time
+    # instead of guessing at a naive string
+    EVENTS.appendleft({"at": datetime.now(timezone.utc).isoformat(),
+                       "kind": kind, "message": message})
 
 
 def _get_rotation():
@@ -141,6 +176,13 @@ broadcaster = EventBroadcaster()
 app = FastAPI(title="Dish Watcher", version="5.1.0")
 STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+@app.on_event("startup")
+async def _start_background():
+    asyncio.create_task(_retention_loop())
+    log.info("retention sweep every %.0fs (clips %sd, frames %sd)",
+             RETENTION_INTERVAL_SEC,
+             config.get("clip_retention_days", 14),
+             config.get("image_retention_days", 30))
 
 
 # -- dashboard auth --
@@ -589,7 +631,12 @@ def _dashboard_payload():
     seconds_in_state = None
     if st.get("entered_at"):
         try:
-            seconds_in_state = (datetime.now() - datetime.fromisoformat(st["entered_at"])).total_seconds()
+            # state_machine writes naive UTC via utcnow(); comparing that against
+            # datetime.now() (local, and the container is on America/New_York)
+            # produced durations about four hours negative.
+            seconds_in_state = max(
+                0.0,
+                (datetime.utcnow() - datetime.fromisoformat(st["entered_at"])).total_seconds())
         except Exception:
             pass
 
@@ -619,7 +666,7 @@ def _dashboard_payload():
         "camera_seen": CAMERA["seen"],
         "latest_frame_url": f"/images/{frame_name}" if frame_name else None,
         "latest_frame_age_seconds": (
-            (datetime.now() - datetime.fromisoformat(last["at"])).total_seconds()
+            max(0.0, (datetime.utcnow() - datetime.fromisoformat(last["at"])).total_seconds())
             if last and last.get("at") else None),
         "live": {
             "wanted": max(0.0, LIVE["wanted_until"] - time.time()) > 0,
@@ -878,7 +925,7 @@ async def upload_frame(
     }
     LAST_DETECTION.clear()
     LAST_DETECTION.update({
-        "at": datetime.now().isoformat(),
+        "at": datetime.utcnow().isoformat(),
         "ssim_score": result["ssim_score"],
         "ssim_tiles": result.get("ssim_tiles", []),
         "labels": result["labels"],
