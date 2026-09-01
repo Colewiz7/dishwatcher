@@ -214,11 +214,14 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 
 .frame {
   width: 100%;
+  height: auto;              /* the frame's own aspect ratio, not a forced one */
   border-radius: var(--radius-inner);
   display: block;
   background: var(--surface-container-highest);
-  aspect-ratio: 4 / 3;
-  object-fit: cover;
+  /* Deliberately NOT object-fit: cover with a fixed aspect-ratio. That crops
+     the sides of a 16:9 frame into a 4:3 box, so a click on the overlay maps
+     to the wrong pixel and the sink area you draw is not the one you get. The
+     image is shown whole, at its own ratio, so the overlay maps 1:1. */
 }
 
 /* ---------- events ---------- */
@@ -399,3 +402,35 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   flex: 1;
   min-width: 120px;
 }
+
+
+/* ---------- roi editor ----------
+   A canvas sitting exactly over the frame. Setting the sink area used to mean
+   typing four pixel coordinates into a prompt, which is both unpleasant and
+   easy to get wrong, and a wrong ROI breaks detection silently. */
+
+#roi-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: var(--radius-inner);
+  cursor: crosshair;
+  touch-action: none;      /* so a drag draws instead of scrolling the page */
+}
+#roi-canvas[hidden] { display: none; }
+
+.roi-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  background: var(--surface-container-lowest);
+  color: var(--on-surface);
+  border-radius: var(--radius-pill);
+  padding: 8px 16px;
+  font-size: .78rem;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.roi-hint[hidden] { display: none; }

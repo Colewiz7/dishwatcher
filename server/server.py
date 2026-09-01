@@ -790,6 +790,19 @@ def _dashboard_payload():
     cam = dict(CAMERA.get("stats") or {})
     frame_name = last.get("image_file") if last else None
 
+    # Fall back to the most recent stored frame when there is no detection yet.
+    # Without this a fresh install has nothing to show: uploads are rejected
+    # while uncalibrated, so LAST_DETECTION stays empty, so the dashboard shows
+    # no frame, so you cannot draw the sink area, so it can never become
+    # calibrated. The frame is saved either way, it just was not surfaced.
+    if not frame_name:
+        try:
+            p = storage.get_latest_image_path()
+            if p:
+                frame_name = Path(p).name
+        except Exception:
+            pass
+
     return {
         "state": st.get("state"),
         "seconds_in_state": seconds_in_state,

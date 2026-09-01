@@ -88,11 +88,16 @@
       <img class="frame" id="frame" alt="latest sink capture">
       <img class="frame" id="live" alt="live camera view" hidden>
       <span class="pill pill-bad live-badge" id="live-badge" hidden><span class="dot"></span>LIVE</span>
+      <!-- drag-to-draw sink area, over the real frame -->
+      <canvas id="roi-canvas" hidden></canvas>
+      <div class="roi-hint" id="roi-hint" hidden>Drag a box around the sink basins</div>
     </div>
     <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
       <button id="live-toggle">Live view</button>
       <button class="primary" id="set-ref">Set clean reference</button>
       <button id="set-roi">Draw sink area</button>
+      <button id="roi-save" hidden class="primary">Save area</button>
+      <button id="roi-cancel" hidden>Cancel</button>
       <button class="danger" id="clear-calib">Clear calibration</button>
     </div>
     <div class="stale" id="frame-age"></div>

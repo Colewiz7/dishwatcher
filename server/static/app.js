@@ -337,57 +337,163 @@ $('clear-calib').addEventListener('click', async (e) => {
   finally { e.target.disabled = false; }
 });
 
-$('set-roi').addEventListener('click', () => {
-  const cur = prompt('Sink area as x1,y1,x2,y2 (pixels in the captured frame):', '');
-  if (!cur) return;
-  const parts = cur.split(',').map(s => parseInt(s.trim(), 10));
-  if (parts.length !== 4 || parts.some(isNaN)) return alert('Need four numbers: x1,y1,x2,y2');
-  post('/calibration/roi', { sink: parts })
-    .then(res => { if (!res.valid) alert('Saved, but still not calibrated:\n\n' + res.reason); })
-    .catch(err => alert('Could not set sink area: ' + err.message));
-});
-
-/* ---------- live view ----------
- * The Pi cannot accept inbound connections, so it pushes frames to the server
- * while a lease is held and the browser reads them back as multipart MJPEG.
- * Opening the stream renews the lease; closing the tab lets it lapse, so the
- * Pi stops on its own rather than streaming forever.
- */
-
+// Declared up here because the sink-area editor below turns live view off
+// before drawing, and `let` is not hoisted: referencing it from the editor
+// while the declaration sat lower down threw a ReferenceError that killed
+// every handler after it.
 let liveOn = false;
 
-function setLive(on) {
-  liveOn = on;
-  const img = $('live'), still = $('frame'), badge = $('live-badge');
-  $('live-toggle').textContent = on ? 'Stop live view' : 'Live view';
-  $('view-title').textContent = on ? 'Live view' : 'Latest capture';
-  badge.hidden = !on;
-  still.hidden = on;
-  img.hidden = !on;
-  if (on) {
-    img.src = '/live.mjpg?t=' + Date.now();
-  } else {
-    img.removeAttribute('src');   // drops the connection so the lease lapses
+/* ---------- sink area editor ----------
+ *
+ * Setting the ROI used to mean typing four pixel coordinates into a prompt.
+ * That is unpleasant, and a wrong box breaks detection without saying so, which
+ * is the same class of failure as the uncalibrated detector. Now you drag a box
+ * on the actual frame.
+ *
+ * The canvas is displayed at whatever size the layout gives it, but the ROI has
+ * to be in the frame's own pixels, so every coordinate is scaled by the ratio
+ * between the natural image size and the rendered size. Getting that wrong
+ * yields a box that looks right and detects the wrong region.
+ */
+
+let roiEditing = false;
+let roiStart = null;
+let roiBox = null;
+
+function frameEl() { return $('frame'); }
+
+function roiScale() {
+  const img = frameEl();
+  const r = img.getBoundingClientRect();
+  if (!img.naturalWidth || !r.width) return null;
+  return { sx: img.naturalWidth / r.width, sy: img.naturalHeight / r.height, rect: r };
+}
+
+function drawRoi() {
+  const cv = $('roi-canvas');
+  const img = frameEl();
+  const r = img.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = Math.round(r.width * dpr);
+  cv.height = Math.round(r.height * dpr);
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, r.width, r.height);
+
+  // dim everything outside the box so the chosen region reads clearly
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(0, 0, r.width, r.height);
+
+  if (!roiBox) return;
+  const { x1, y1, x2, y2 } = roiBox;
+  ctx.clearRect(x1, y1, x2 - x1, y2 - y1);
+
+  const accent = getComputedStyle(document.documentElement)
+    .getPropertyValue('--primary').trim() || '#ffb693';
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+  const s = roiScale();
+  if (s) {
+    const w = Math.round((x2 - x1) * s.sx), h = Math.round((y2 - y1) * s.sy);
+    ctx.fillStyle = accent;
+    ctx.font = '600 12px system-ui, sans-serif';
+    ctx.fillText(`${w} x ${h}px`, x1 + 6, Math.max(14, y1 - 6));
   }
 }
 
-$('live-toggle').addEventListener('click', async (e) => {
+function pointIn(ev) {
+  const r = $('roi-canvas').getBoundingClientRect();
+  const p = ev.touches ? ev.touches[0] : ev;
+  return {
+    x: Math.max(0, Math.min(r.width, p.clientX - r.left)),
+    y: Math.max(0, Math.min(r.height, p.clientY - r.top)),
+  };
+}
+
+function startRoiEdit() {
+  const img = frameEl();
+  if (!img.naturalWidth) {
+    return alert('No frame to draw on yet. Wait for the camera to send one.');
+  }
+  roiEditing = true;
+  roiBox = null;
+  if (liveOn) setLive(false);          // draw on a still, not a moving picture
+  $('roi-canvas').hidden = false;
+  $('roi-hint').hidden = false;
+  $('roi-save').hidden = false;
+  $('roi-cancel').hidden = false;
+  $('set-roi').hidden = true;
+  drawRoi();
+}
+
+function endRoiEdit() {
+  roiEditing = false;
+  roiStart = null;
+  roiBox = null;
+  $('roi-canvas').hidden = true;
+  $('roi-hint').hidden = true;
+  $('roi-save').hidden = true;
+  $('roi-cancel').hidden = true;
+  $('set-roi').hidden = false;
+}
+
+(function wireRoi() {
+  const cv = $('roi-canvas');
+
+  const down = (ev) => {
+    if (!roiEditing) return;
+    ev.preventDefault();
+    roiStart = pointIn(ev);
+    roiBox = null;
+  };
+  const move = (ev) => {
+    if (!roiEditing || !roiStart) return;
+    ev.preventDefault();
+    const p = pointIn(ev);
+    roiBox = {
+      x1: Math.min(roiStart.x, p.x), y1: Math.min(roiStart.y, p.y),
+      x2: Math.max(roiStart.x, p.x), y2: Math.max(roiStart.y, p.y),
+    };
+    drawRoi();
+  };
+  const up = () => { roiStart = null; };
+
+  cv.addEventListener('mousedown', down);
+  cv.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', up);
+  cv.addEventListener('touchstart', down, { passive: false });
+  cv.addEventListener('touchmove', move, { passive: false });
+  window.addEventListener('touchend', up);
+  window.addEventListener('resize', () => { if (roiEditing) drawRoi(); });
+})();
+
+$('set-roi').addEventListener('click', startRoiEdit);
+$('roi-cancel').addEventListener('click', endRoiEdit);
+
+$('roi-save').addEventListener('click', async (e) => {
+  if (!roiBox) return alert('Drag a box around the sink first.');
+  const s = roiScale();
+  if (!s) return alert('Could not measure the frame. Try again once it has loaded.');
+
+  // canvas pixels -> frame pixels; the server stores the frame's coordinates
+  const sink = [
+    Math.round(roiBox.x1 * s.sx), Math.round(roiBox.y1 * s.sy),
+    Math.round(roiBox.x2 * s.sx), Math.round(roiBox.y2 * s.sy),
+  ];
+  if (sink[2] - sink[0] < 32 || sink[3] - sink[1] < 32) {
+    return alert('That box is too small to compare reliably. Draw a bigger one.');
+  }
+
   e.target.disabled = true;
   try {
-    if (liveOn) { await post('/live/stop'); setLive(false); }
-    else { await post('/live/request'); setLive(true); }
+    const res = await post('/calibration/roi', { sink });
+    if (!res.valid) alert('Saved, but calibration is still incomplete:\n\n' + res.reason);
+    endRoiEdit();
   } catch (err) {
-    alert('Live view failed: ' + err.message);
+    alert('Could not save the sink area: ' + err.message);
   } finally { e.target.disabled = false; }
-});
-
-// a wedged or absent camera cannot serve live frames; say so rather than
-// showing a broken image icon
-$('live').addEventListener('error', () => {
-  if (liveOn) { $('live-badge').className = 'pill pill-warn live-badge'; }
-});
-$('live').addEventListener('load', () => {
-  $('live-badge').className = 'pill pill-bad live-badge';
 });
 
 /* ---------- roommates + blame clips ---------- */
