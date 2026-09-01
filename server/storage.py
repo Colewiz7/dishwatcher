@@ -3,6 +3,7 @@
 
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -187,3 +188,89 @@ def get_video_path(filename):
 
 def get_thumb_path(filename):
     return os.path.join(_thumb_dir, Path(filename).name)
+
+
+# -- v2 additions --
+
+def latest_frame():
+    """
+    The most recent captured frame as a BGR array, or None.
+
+    Used by the dashboard's "set clean reference" button: the reference is
+    always a real frame the camera actually produced, so it cannot disagree
+    with the live view's geometry.
+    """
+    import cv2
+    path = get_latest_image_path()
+    if not path:
+        return None
+    return cv2.imread(str(path))
+
+
+def total_bytes():
+    """Bytes held under the data directory, for the storage metric."""
+    total = 0
+    for d in (_img_dir, _vid_dir, _thumb_dir):
+        if not d:
+            continue
+        p = Path(d)
+        if not p.exists():
+            continue
+        for f in p.rglob("*"):
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    pass
+    return total
+
+
+def oldest_clip_age_seconds():
+    p = Path(_vid_dir) if _vid_dir else None
+    if not p or not p.exists():
+        return 0.0
+    files = [f for f in p.glob("*") if f.is_file()]
+    if not files:
+        return 0.0
+    return time.time() - min(f.stat().st_mtime for f in files)
+
+
+def enforce_retention(clip_days, image_days):
+    """
+    Delete media past its retention window.
+
+    v1 had no cleanup at all and its own TODO admitted it. This is blame-clip
+    footage of people in a home, so unbounded retention is a real problem and
+    not just a disk one. Returns a summary for logging and metrics.
+    """
+    now = time.time()
+    removed = {"clips": 0, "images": 0, "bytes": 0, "removed_clips": []}
+
+    for directory, days, key in ((_vid_dir, clip_days, "clips"),
+                                 (_img_dir, image_days, "images"),
+                                 (_thumb_dir, image_days, "images")):
+        if not directory or days <= 0:
+            continue
+        cutoff = now - days * 86400
+        p = Path(directory)
+        if not p.exists():
+            continue
+        for f in p.glob("*"):
+            if not f.is_file():
+                continue
+            try:
+                st = f.stat()
+                if st.st_mtime < cutoff:
+                    size = st.st_size
+                    f.unlink()
+                    if key == "clips":
+                        removed["removed_clips"].append(f.name)
+                    removed[key] += 1
+                    removed["bytes"] += size
+            except OSError as e:
+                log.warning("retention could not remove %s: %s", f, e)
+
+    if removed["clips"] or removed["images"]:
+        log.info("retention removed %d clips and %d images (%.1f MB)",
+                 removed["clips"], removed["images"], removed["bytes"] / 1e6)
+    return removed

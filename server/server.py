@@ -3,10 +3,14 @@
 # uvicorn server:app --host 0.0.0.0 --port 8000
 
 import asyncio
+import base64
+import ipaddress
 import json
 import logging
 import os
-from datetime import datetime
+import secrets
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -17,9 +21,12 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse
 
+import calibration as calibration_mod
 import config
 import detector
+import metrics
 import notifier
+import people
 import state_machine
 import storage
 
@@ -40,9 +47,104 @@ log = logging.getLogger("dishwatcher.server")
 
 os.environ.setdefault("DATA_DIR", SAVE_DIR)
 config.init(SAVE_DIR)
-detector.load_model()
 storage.configure(SAVE_DIR)
+people.configure(SAVE_DIR)
 sm = state_machine.DishStateMachine()
+
+# Calibration is a first-class object now. v1 hid it inside detector.py behind a
+# guard that silently disabled detection; this one is queried on every request
+# and exported as a metric.
+calib = calibration_mod.Calibration(SAVE_DIR)
+
+# Startup self-checks. Anything critical that fails here keeps /readyz red, so
+# k8s and Argo will not call the app Healthy while it is quietly doing nothing.
+SELF_CHECKS = {}
+
+
+def run_self_checks():
+    """Prove the things v1 assumed. Results drive /readyz and the metric."""
+    ok, msg = calib.self_check()
+    SELF_CHECKS["calibration"] = {"ok": ok, "detail": msg}
+    metrics.gauge("dishwatcher_calibration_valid", 1 if calib.is_valid() else 0)
+    if ok:
+        log.info("self-check calibration: OK (%s)", msg)
+    else:
+        log.warning("self-check calibration: FAILED - %s", msg)
+
+    try:
+        detector._get_yolo()
+        SELF_CHECKS["labeller"] = {"ok": True, "detail": "loaded or gracefully disabled"}
+    except Exception as e:
+        SELF_CHECKS["labeller"] = {"ok": False, "detail": str(e)}
+
+    return SELF_CHECKS
+
+
+run_self_checks()
+
+# camera health, reported by the edge node on each upload
+CAMERA = {"seen": False, "last_report": None, "stats": {}}
+
+RETENTION_INTERVAL_SEC = float(os.environ.get("RETENTION_INTERVAL_SEC", "3600"))
+SSE_HEARTBEAT_SEC = float(os.environ.get("SSE_HEARTBEAT_SEC", "2.0"))
+
+
+async def _retention_loop():
+    """
+    Delete media past its window, hourly.
+
+    storage.enforce_retention() existed for a while with nothing calling it,
+    which is the same shape of bug as v1's detector: code that looks like a
+    feature but never runs. The metrics below make it observable, so "retention
+    is not actually running" is visible rather than assumed.
+    """
+    while True:
+        try:
+            removed = await asyncio.to_thread(
+                storage.enforce_retention,
+                config.get("clip_retention_days", 14),
+                config.get("image_retention_days", 30),
+            )
+            metrics.inc("dishwatcher_clips_deleted_total", removed.get("clips", 0))
+            for gone in removed.get("removed_clips", []):
+                people.forget_clip(gone)
+            metrics.gauge("dishwatcher_oldest_clip_age_seconds",
+                          storage.oldest_clip_age_seconds())
+            metrics.gauge("dishwatcher_storage_bytes", storage.total_bytes())
+            if removed.get("clips") or removed.get("images"):
+                record_event("info",
+                             f"retention removed {removed['clips']} clips, "
+                             f"{removed['images']} frames")
+        except Exception as e:
+            log.warning("retention sweep failed: %s", e)
+        await asyncio.sleep(RETENTION_INTERVAL_SEC)
+
+
+# Last detection and a short event ring, so the dashboard has something to
+# paint immediately on load instead of a cold spinner.
+from collections import deque  # noqa: E402
+LAST_DETECTION = {}
+EVENTS = deque(maxlen=60)
+
+# Live view.
+#
+# The Pi never accepts inbound connections (it moves between networks and sits
+# behind NAT), so the browser cannot pull from it directly. Instead the server
+# holds a "live wanted until" deadline; the camera reads that off every health
+# report and, while it is in the future, pushes frames here at LIVE_FPS. The
+# browser consumes them as multipart MJPEG.
+#
+# The deadline auto-expires so a closed browser tab cannot leave the Pi
+# streaming forever and burning its USB bus and battery of CPU.
+LIVE = {"wanted_until": 0.0, "frame": None, "frame_at": 0.0, "seq": 0}
+LIVE_LEASE_SEC = float(os.environ.get("LIVE_LEASE_SEC", "120"))
+
+
+def record_event(kind, message):
+    # timezone-aware, so the browser converts to the viewer's local time
+    # instead of guessing at a naive string
+    EVENTS.appendleft({"at": datetime.now(timezone.utc).isoformat(),
+                       "kind": kind, "message": message})
 
 
 def _get_rotation():
@@ -79,6 +181,151 @@ broadcaster = EventBroadcaster()
 app = FastAPI(title="Dish Watcher", version="5.1.0")
 STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+@app.on_event("startup")
+async def _start_background():
+    asyncio.create_task(_retention_loop())
+    log.info("retention sweep every %.0fs (clips %sd, frames %sd)",
+             RETENTION_INTERVAL_SEC,
+             config.get("clip_retention_days", 14),
+             config.get("image_retention_days", 30))
+
+
+# -- dashboard auth --
+#
+# This app is reachable at sink.colewiz.dev, and the dashboard shows blame
+# clips: video of people inside the flat. Unlike the other tunnel routes it
+# does not sit behind Authentik, so it authenticates itself.
+#
+# Exempt: /healthz and /readyz (kubelet probes), /metrics (Prometheus scrapes
+# in-cluster), and the camera endpoints, which carry their own API key. A
+# browser hitting anything else needs the password.
+
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "")
+DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "cole")
+
+# When Authentik proxies this app it has already authenticated the user and
+# injects X-authentik-username. Accepting that avoids a second password prompt
+# on top of the SSO login.
+#
+# The header is only trusted when this is on, and it is on because the public
+# route reaches the app exclusively through the Authentik outpost. The other
+# way in is the NodePort, which is reachable only from the internal bridge and
+# the tailnet, both already authenticated; anyone there could forge the header,
+# so this is not a substitute for the tailnet being trusted. Basic auth stays
+# as the fallback for that path.
+TRUST_FORWARD_AUTH = os.environ.get("TRUST_FORWARD_AUTH", "false").lower() == "true"
+FORWARD_AUTH_HEADER = "x-authentik-username"
+
+# The header is only believed from inside the cluster. Authentik proxies from a
+# pod, so those requests arrive from the pod CIDR; the NodePort preserves the
+# real client address, so a tailnet client shows up as 100.x and cannot get in
+# by simply setting the header itself. Without this check the header is a
+# complete auth bypass for anyone who can reach the NodePort.
+FORWARD_AUTH_NETS = [
+    ipaddress.ip_network(n.strip())
+    for n in os.environ.get("FORWARD_AUTH_NETWORKS", "10.42.0.0/16,10.43.0.0/16").split(",")
+    if n.strip()
+]
+
+
+def _forward_auth_ok(request: Request) -> bool:
+    """True only for an authenticated request that actually came via the proxy."""
+    if not TRUST_FORWARD_AUTH:
+        return False
+    if not request.headers.get(FORWARD_AUTH_HEADER, ""):
+        return False
+    client = request.client.host if request.client else None
+    if not client:
+        return False
+    try:
+        addr = ipaddress.ip_address(client)
+    except ValueError:
+        return False
+    return any(addr in net for net in FORWARD_AUTH_NETS)
+
+_AUTH_EXEMPT_EXACT = {"/healthz", "/readyz", "/metrics"}
+
+# Paths that must never be served to a request that arrived from the internet,
+# regardless of how well authenticated it is. Roommate photos are pictures of
+# people who did not sign up to be on a public host, and "it is behind SSO" is
+# not the same promise as "it never leaves the flat". These are reachable only
+# over the tailnet or from inside the cluster network.
+LOCAL_ONLY_PATTERNS = ("/people/", "/thumbs/", "/videos/")
+PUBLIC_HOSTNAMES = {
+    h.strip().lower()
+    for h in os.environ.get("PUBLIC_HOSTNAMES", "sink.colewiz.dev").split(",")
+    if h.strip()
+}
+
+
+def _is_local_only_path(path: str) -> bool:
+    # /people (the roster: names and counts) is fine; a photo is not
+    if path.startswith("/people/") and path.endswith("/photo"):
+        return True
+    return path.startswith(("/thumbs/", "/videos/"))
+
+
+def _came_from_the_internet(request: Request) -> bool:
+    """
+    True when the request arrived through the Cloudflare tunnel.
+
+    Two independent signals, because either alone can be spoofed by something
+    already inside the cluster: the Authentik outpost stamps its own headers on
+    anything it proxies, and the public Host header only appears on requests
+    that resolved the public name.
+    """
+    if request.headers.get(FORWARD_AUTH_HEADER, ""):
+        return True
+    host = (request.headers.get("host") or "").split(":")[0].lower()
+    if host in PUBLIC_HOSTNAMES:
+        return True
+    return bool(request.headers.get("cf-ray") or request.headers.get("cf-connecting-ip"))
+_AUTH_EXEMPT_PREFIX = ("/upload", "/camera/", "/live/frame")
+
+
+@app.middleware("http")
+async def dashboard_auth(request: Request, call_next):
+    if not DASHBOARD_PASSWORD:
+        # No password configured: fail closed for anything that is not a probe,
+        # rather than silently serving the flat to the internet. Being loudly
+        # broken beats being quietly open; that is the lesson from v1.
+        path = request.url.path
+        if path in _AUTH_EXEMPT_EXACT or path.startswith(_AUTH_EXEMPT_PREFIX):
+            return await call_next(request)
+        if _forward_auth_ok(request):
+            return await call_next(request)
+        return JSONResponse(
+            {"error": "DASHBOARD_PASSWORD is not set, so the dashboard is disabled",
+             "fix": "set DASHBOARD_PASSWORD in the dishwatcher-secrets secret"},
+            status_code=503)
+
+    path = request.url.path
+    if path in _AUTH_EXEMPT_EXACT or path.startswith(_AUTH_EXEMPT_PREFIX):
+        return await call_next(request)
+
+    if _is_local_only_path(path) and _came_from_the_internet(request):
+        log.info("refused %s from the public route", path)
+        return JSONResponse(
+            {"error": "not available over the internet",
+             "detail": "photos and clips are served only on the local network"},
+            status_code=403)
+
+    if _forward_auth_ok(request):
+        return await call_next(request)
+
+    header = request.headers.get("authorization", "")
+    if header.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(header[6:]).decode("utf-8", "replace")
+            user, _, password = decoded.partition(":")
+            # constant time, so the password cannot be recovered by timing
+            if (secrets.compare_digest(user, DASHBOARD_USER)
+                    and secrets.compare_digest(password, DASHBOARD_PASSWORD)):
+                return await call_next(request)
+        except Exception:
+            pass
+
+    return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="dishwatcher"'})
 
 
 def _check_api_key(key):
@@ -108,16 +355,317 @@ def _decode_frame(raw):
 @app.get("/healthz")
 async def healthz():
     return JSONResponse({
-        "status": "ok", "version": "5.1.0",
+        "status": "ok", "version": "2.0.0",
         "state": sm.state.value,
-        "has_reference": detector.has_reference(),
-        "has_roi": detector.get_roi() is not None,
+        "has_reference": calib.state().has_reference,
+        "has_roi": calib.state().has_roi,
+        "calibrated": calib.is_valid(),
         "sse_clients": broadcaster.client_count,
         "password_required": bool(config.get("admin_password")),
     })
 
 
 # -- config / settings --
+
+@app.get("/readyz")
+async def readyz():
+    """
+    Readiness means "can serve traffic", NOT "is calibrated".
+
+    Gating readiness on calibration is tempting, because an uncalibrated
+    detector is the exact v1 failure. But a Service drops NotReady pods from
+    its endpoints, so a strict probe would make the dashboard unreachable and
+    the dashboard is where you calibrate. It would deadlock on first deploy.
+
+    So calibration is surfaced everywhere it can be seen without blocking the
+    fix: a WARNING at startup, dishwatcher_calibration_valid in /metrics with an
+    alert rule on it, a banner across the top of the dashboard, and a 409 on
+    every upload. The one thing it must never be again is invisible.
+    """
+    state = calib.state()
+    metrics.gauge("dishwatcher_calibration_valid", 1 if state.valid else 0)
+
+    can_serve = STATIC_DIR.is_dir()
+    return JSONResponse(
+        {
+            "ready": can_serve,
+            "calibrated": state.valid,
+            "calibration": state.as_dict(),
+            "checks": {
+                "can_serve": can_serve,
+                "camera_seen": CAMERA["seen"],
+                "calibration_valid": state.valid,
+            },
+            "self_checks": SELF_CHECKS,
+        },
+        status_code=200 if can_serve else 503,
+    )
+
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    state = calib.state()
+    metrics.gauge("dishwatcher_calibration_valid", 1 if state.valid else 0)
+    cam = CAMERA.get("stats") or {}
+    if CAMERA["seen"]:
+        for key, metric in (
+            ("seconds_since_last_frame", "dishwatcher_camera_seconds_since_last_frame"),
+            ("reopens", "dishwatcher_camera_reopens_total"),
+            ("usb_resets", "dishwatcher_camera_usb_resets_total"),
+            ("flap_ratio", "dishwatcher_motion_flap_ratio"),
+        ):
+            if key in cam:
+                metrics.gauge(metric, cam[key])
+    try:
+        metrics.gauge("dishwatcher_storage_bytes", storage.total_bytes())
+    except Exception:
+        pass
+    return Response(content=metrics.render(), media_type="text/plain; version=0.0.4")
+
+
+@app.post("/live/request")
+async def live_request():
+    """Browser asks for live view. Extends the lease the camera polls."""
+    LIVE["wanted_until"] = time.time() + LIVE_LEASE_SEC
+    return JSONResponse({"live": True, "lease_seconds": LIVE_LEASE_SEC})
+
+
+@app.post("/live/stop")
+async def live_stop():
+    LIVE["wanted_until"] = 0.0
+    return JSONResponse({"live": False})
+
+
+@app.get("/live/state")
+async def live_state():
+    remaining = max(0.0, LIVE["wanted_until"] - time.time())
+    return JSONResponse({
+        "live_wanted": remaining > 0,
+        "lease_remaining": round(remaining, 1),
+        "have_frame": LIVE["frame"] is not None,
+        "frame_age": round(time.time() - LIVE["frame_at"], 1) if LIVE["frame_at"] else None,
+    })
+
+
+@app.post("/live/frame")
+async def live_frame(frame: UploadFile = File(...),
+                     x_api_key: Optional[str] = Header(default=None)):
+    """Camera pushes a frame while the live lease is active."""
+    _check_api_key(x_api_key)
+    raw = await frame.read()
+    if raw:
+        LIVE["frame"] = raw
+        LIVE["frame_at"] = time.time()
+        LIVE["seq"] += 1
+    remaining = max(0.0, LIVE["wanted_until"] - time.time())
+    # tell the camera whether to keep going, so it stops on its own
+    return JSONResponse({"keep_streaming": remaining > 0,
+                         "lease_remaining": round(remaining, 1)})
+
+
+@app.get("/live.mjpg")
+async def live_mjpeg(request: Request):
+    """
+    Multipart MJPEG of whatever the camera last pushed.
+
+    Requesting the stream also renews the lease, so simply having the tab open
+    keeps frames flowing and closing it lets them stop.
+    """
+    boundary = "dishwatcherframe"
+
+    async def gen():
+        last_seq = -1
+        idle_since = time.time()
+        # NOTE: deliberately no request.is_disconnected() here. For a GET with
+        # no body it awaits receive(), which does not return until the client
+        # actually disconnects, so it blocks the generator forever and the
+        # stream yields nothing. Starlette closes the generator on disconnect
+        # anyway, and the idle timeout below bounds the rest.
+        while True:
+            LIVE["wanted_until"] = time.time() + LIVE_LEASE_SEC
+            if LIVE["frame"] is not None and LIVE["seq"] != last_seq:
+                last_seq = LIVE["seq"]
+                idle_since = time.time()
+                chunk = LIVE["frame"]
+                yield (f"--{boundary}\r\nContent-Type: image/jpeg\r\n"
+                       f"Content-Length: {len(chunk)}\r\n\r\n").encode() + chunk + b"\r\n"
+            else:
+                # no new frame yet; give up after a while rather than hanging
+                if time.time() - idle_since > 30:
+                    break
+            await asyncio.sleep(0.08)
+
+    return StreamingResponse(
+        gen(),
+        media_type=f"multipart/x-mixed-replace; boundary={boundary}",
+        headers={"Cache-Control": "no-cache, no-store", "Pragma": "no-cache",
+                 "X-Accel-Buffering": "no"})
+
+
+@app.get("/clips")
+async def list_clips(limit: int = Query(40, ge=1, le=200)):
+    """
+    Saved blame clips, newest first, with whoever they are attributed to.
+
+    The clips were being recorded from the start and there was no way to watch
+    one, so they were evidence nobody could read.
+    """
+    out = []
+    for v in storage.list_videos(limit=limit):
+        name = v.get("filename") or v.get("name")
+        if not name:
+            continue
+        out.append({
+            **v,
+            "url": f"/videos/{name}",
+            "thumb_url": f"/thumbs/{v['thumb']}" if v.get("thumb") else None,
+            "tag": people.tag_of(name),
+        })
+    return JSONResponse({"clips": out, "counts": people.counts()})
+
+
+@app.get("/thumbs/{filename}")
+async def get_thumb(filename: str):
+    path = storage.get_thumb_path(Path(filename).name)
+    if not path or not Path(path).is_file():
+        raise HTTPException(404, "no such thumbnail")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/people")
+async def get_people():
+    return JSONResponse({"people": people.list_people(), "counts": people.counts()})
+
+
+@app.post("/people")
+async def create_person(request: Request):
+    body = await request.json()
+    try:
+        pid = people.add_person(body.get("name"))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return JSONResponse({"id": pid, "people": people.list_people()})
+
+
+@app.post("/people/{pid}/photo")
+async def upload_photo(pid: str, photo: UploadFile = File(...)):
+    raw = await photo.read()
+    try:
+        people.set_photo(pid, raw, photo.content_type)
+    except KeyError:
+        raise HTTPException(404, "no such person")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    return JSONResponse({"ok": True, "people": people.list_people()})
+
+
+@app.get("/people/{pid}/photo")
+async def get_photo(pid: str):
+    path = people.photo_path(pid)
+    if not path:
+        raise HTTPException(404, "no photo")
+    media = "image/png" if path.suffix == ".png" else "image/jpeg"
+    return FileResponse(str(path), media_type=media)
+
+
+@app.delete("/people/{pid}")
+async def delete_person(pid: str):
+    try:
+        people.remove_person(pid)
+    except KeyError:
+        raise HTTPException(404, "no such person")
+    return JSONResponse({"ok": True, "people": people.list_people()})
+
+
+@app.post("/clips/{filename}/tag")
+async def tag_clip(filename: str, request: Request):
+    """Attribute a clip to someone, or clear it with person_id null."""
+    body = await request.json()
+    pid = body.get("person_id")
+    try:
+        tag = people.tag_clip(Path(filename).name, pid)
+    except KeyError:
+        raise HTTPException(404, "no such person")
+    who = people.name_of(pid) if pid else None
+    record_event("info", f"clip attributed to {who}" if who else "clip attribution cleared")
+    await broadcaster.publish("clips", {"filename": filename})
+    return JSONResponse({"ok": True, "tag": tag})
+
+
+@app.get("/images/{filename}")
+async def get_image(filename: str):
+    # basename only: never let a path component escape the data directory
+    path = storage.get_image_path(Path(filename).name)
+    if not path or not Path(path).is_file():
+        raise HTTPException(404, "no such image")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/videos/{filename}")
+async def get_video(filename: str):
+    path = storage.get_video_path(Path(filename).name)
+    if not path or not Path(path).is_file():
+        raise HTTPException(404, "no such video")
+    return FileResponse(path, media_type="video/mp4")
+
+
+@app.get("/")
+async def index():
+    return FileResponse(STATIC_DIR / "viewer.html")
+
+
+@app.get("/calibration")
+async def calibration_status():
+    return JSONResponse(calib.state().as_dict())
+
+
+@app.post("/calibration/reference")
+async def calibration_set_reference():
+    """Promote the most recent capture to the clean reference."""
+    frame = storage.latest_frame()
+    if frame is None:
+        raise HTTPException(409, "no capture available yet; wait for the camera to send one")
+    state = calib.set_reference(frame)
+    run_self_checks()
+    record_event("info", "clean reference set")
+    await broadcaster.publish("calibration", state.as_dict())
+    return JSONResponse(state.as_dict())
+
+
+@app.post("/calibration/roi")
+async def calibration_set_roi(request: Request):
+    body = await request.json()
+    sink = body.get("sink")
+    if not (isinstance(sink, list) and len(sink) == 4):
+        raise HTTPException(422, "sink must be [x1, y1, x2, y2]")
+    state = calib.set_roi({"sink": [int(v) for v in sink]})
+    run_self_checks()
+    record_event("info", "sink area set")
+    await broadcaster.publish("calibration", state.as_dict())
+    return JSONResponse(state.as_dict())
+
+
+@app.post("/calibration/clear")
+async def calibration_clear():
+    state = calib.clear()
+    run_self_checks()
+    record_event("info", "calibration cleared")
+    await broadcaster.publish("calibration", state.as_dict())
+    return JSONResponse(state.as_dict())
+
+
+@app.post("/camera/report")
+async def camera_report(request: Request, x_api_key: Optional[str] = Header(default=None)):
+    """Edge node health. Drives the camera card and the wedge alerts."""
+    _check_api_key(x_api_key)
+    CAMERA["stats"] = await request.json()
+    CAMERA["seen"] = True
+    CAMERA["last_report"] = datetime.now().isoformat()
+    remaining = max(0.0, LIVE["wanted_until"] - time.time())
+    return JSONResponse({"ok": True, "live_wanted": remaining > 0,
+                         "lease_remaining": round(remaining, 1),
+                         "live_fps": float(os.environ.get("LIVE_FPS", "4"))})
+
 
 @app.get("/config/schema")
 async def config_schema():
@@ -181,8 +729,9 @@ async def sse_stream(request: Request):
         try:
             initial = json.dumps({
                 "type": "init", "status": sm.get_status(), "stats": sm.get_stats(),
-                "has_reference": detector.has_reference(),
-                "roi": detector.get_roi(),
+                "has_reference": calib.state().has_reference,
+                "roi": calib.roi,
+                "calibration": calib.state().as_dict(),
                 "config": config.get_schema(),
                 "password_required": bool(config.get("admin_password")),
             }, default=str)
@@ -206,9 +755,109 @@ async def sse_stream(request: Request):
 
 # -- status --
 
+def _dashboard_payload():
+    """
+    Everything the dashboard needs in one object.
+
+    Deliberately a single shape shared by GET /status and the SSE stream, so
+    the page has exactly one renderer and cannot drift between the two paths.
+    """
+    st = sm.get_status()
+    cal = calib.state()
+    last = LAST_DETECTION
+
+    seconds_in_state = None
+    if st.get("entered_at"):
+        try:
+            # state_machine writes naive UTC via utcnow(); comparing that against
+            # datetime.now() (local, and the container is on America/New_York)
+            # produced durations about four hours negative.
+            seconds_in_state = max(
+                0.0,
+                (datetime.utcnow() - datetime.fromisoformat(st["entered_at"])).total_seconds())
+        except Exception:
+            pass
+
+    grace = st.get("grace_remaining")
+    seconds_until_alert = None
+    if grace:
+        try:
+            h, m, s = str(grace).split(":")
+            seconds_until_alert = int(h) * 3600 + int(m) * 60 + float(s)
+        except Exception:
+            pass
+
+    cam = dict(CAMERA.get("stats") or {})
+    frame_name = last.get("image_file") if last else None
+
+    # Fall back to the most recent stored frame when there is no detection yet.
+    # Without this a fresh install has nothing to show: uploads are rejected
+    # while uncalibrated, so LAST_DETECTION stays empty, so the dashboard shows
+    # no frame, so you cannot draw the sink area, so it can never become
+    # calibrated. The frame is saved either way, it just was not surfaced.
+    if not frame_name:
+        try:
+            p = storage.get_latest_image_path()
+            if p:
+                frame_name = Path(p).name
+        except Exception:
+            pass
+
+    return {
+        "state": st.get("state"),
+        "seconds_in_state": seconds_in_state,
+        "seconds_until_alert": seconds_until_alert,
+        "calibration": cal.as_dict(),
+        "ssim_score": last.get("ssim_score") if last else None,
+        "ssim_tiles": last.get("ssim_tiles", []) if last else [],
+        "ssim_threshold": config.get("ssim_threshold", 0.82),
+        "labels": last.get("labels", []) if last else [],
+        "inference_ms": last.get("inference_ms") if last else None,
+        "camera": cam,
+        "camera_seen": CAMERA["seen"],
+        "latest_frame_url": f"/images/{frame_name}" if frame_name else None,
+        "latest_frame_age_seconds": (
+            max(0.0, (datetime.utcnow() - datetime.fromisoformat(last["at"])).total_seconds())
+            if last and last.get("at") else None),
+        "live": {
+            "wanted": max(0.0, LIVE["wanted_until"] - time.time()) > 0,
+            "have_frame": LIVE["frame"] is not None,
+            "frame_age": round(time.time() - LIVE["frame_at"], 1) if LIVE["frame_at"] else None,
+        },
+        "media_local_only": True,
+        "events": list(EVENTS),
+        "consensus": st.get("consensus"),
+    }
+
+
 @app.get("/status")
 async def status():
-    return JSONResponse(sm.get_status())
+    return JSONResponse(_dashboard_payload())
+
+
+@app.get("/status/stream")
+async def status_stream(request: Request):
+    """SSE feed of the same payload GET /status returns."""
+    async def gen():
+        yield f"data: {json.dumps(_dashboard_payload(), default=str)}\n\n"
+        q = broadcaster.subscribe()
+        try:
+            while True:
+                # Push on an event, or every couple of seconds regardless, so
+                # the counters and timers keep moving. This used to wait 15s,
+                # which made a working dashboard look frozen. The payload is
+                # small and takes about 3ms to build, so the cost is noise.
+                try:
+                    await asyncio.wait_for(q.get(), timeout=SSE_HEARTBEAT_SEC)
+                except asyncio.TimeoutError:
+                    pass
+                yield f"data: {json.dumps(_dashboard_payload(), default=str)}\n\n"
+        finally:
+            broadcaster.unsubscribe(q)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 @app.get("/status/stats")
 async def status_stats():
@@ -242,25 +891,41 @@ async def set_reference(
         if frame is None:
             raise HTTPException(500, "couldnt read latest frame")
 
-    detector.save_reference(frame)
+    calib.set_reference(frame)
 
-    roi = detector.get_roi()
+    roi = calib.roi
     if roi is None or "sink" not in roi:
         sink_bbox = detector.auto_detect_sink(frame)
         if sink_bbox:
-            detector.save_roi({"sink": sink_bbox})
+            calib.set_roi({"sink": sink_bbox})
 
     await broadcaster.publish("admin", {
-        "action": "reference_set", "has_reference": True, "roi": detector.get_roi()})
-    return JSONResponse({"status": "ok", "roi": detector.get_roi()})
+        "action": "reference_set", "has_reference": True, "roi": calib.roi})
+    return JSONResponse({"status": "ok", "roi": calib.roi, "calibration": calib.state().as_dict()})
 
 
 @app.get("/admin/reference.jpg")
-async def get_reference():
-    ref = detector.get_reference()
+@app.get("/calibration/reference.jpg")
+async def get_reference(roi_only: bool = Query(False)):
+    """
+    The stored reference.
+
+    roi_only crops to the sink and upscales it, which is the view that actually
+    answers "is my reference clean?". A fork sitting in a basin is invisible at
+    full frame and completely obvious at 3x, and a reference with a fork in it
+    silently teaches the system that the fork is normal.
+    """
+    ref = calib.reference
     if ref is None:
         raise HTTPException(404, "no reference")
-    _, buf = cv2.imencode(".jpg", ref, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    img = ref
+    if roi_only:
+        roi = (calib.roi or {}).get("sink")
+        if roi:
+            img = detector.crop_roi(ref, roi)
+            if img.size:
+                img = cv2.resize(img, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])
     return Response(content=buf.tobytes(), media_type="image/jpeg")
 
 
@@ -269,13 +934,13 @@ async def set_roi(request: Request):
     data = await request.json()
     if "sink" not in data:
         raise HTTPException(400, "need 'sink' roi")
-    detector.save_roi(data)
+    calib.set_roi(data)
     await broadcaster.publish("admin", {"action": "roi_set", "roi": data})
     return JSONResponse({"status": "ok", "roi": data})
 
 @app.get("/admin/roi")
 async def get_roi():
-    return JSONResponse(detector.get_roi() or {})
+    return JSONResponse(calib.roi or {})
 
 @app.post("/admin/auto-detect-sink")
 async def auto_detect_sink():
@@ -286,9 +951,9 @@ async def auto_detect_sink():
     bbox = detector.auto_detect_sink(frame)
     if bbox is None:
         raise HTTPException(404, "no sink found")
-    roi = detector.get_roi() or {}
+    roi = calib.roi or {}
     roi["sink"] = bbox
-    detector.save_roi(roi)
+    calib.set_roi(roi)
     await broadcaster.publish("admin", {"action": "roi_set", "roi": roi})
     return JSONResponse({"status": "ok", "roi": roi})
 
@@ -338,15 +1003,46 @@ async def upload_frame(
                 rotation=_get_rotation(),
             )
 
-    # run detection (uses config values internally)
-    result = detector.detect(img)
+    # Run detection. The uncalibrated case now RAISES rather than returning a
+    # default score that reads as clean, which is the v1 bug this whole rewrite
+    # exists to kill. We record it, tell the camera plainly, and stop; we do not
+    # advance the state machine on a guess.
+    try:
+        result = detector.detect(
+            img,
+            calib,
+            ssim_threshold=config.get("ssim_threshold", 0.82),
+            yolo_enabled=config.get("yolo_enabled", True),
+            confidence=config.get("confidence_threshold", 0.40),
+        )
+    except detector.NotCalibrated as e:
+        metrics.inc("dishwatcher_detections_total", outcome="uncalibrated")
+        metrics.gauge("dishwatcher_calibration_valid", 0)
+        storage.save_frame(img, False, state="UNCALIBRATED",
+                           quality=config.get("jpeg_quality", 90))
+        log.warning("upload rejected: not calibrated (%s)", e.reason)
+        record_event("alert", f"upload rejected, not calibrated: {e.reason}")
+        await broadcaster.publish("calibration", calib.state().as_dict())
+        return JSONResponse(
+            {"state": "UNCALIBRATED", "calibrated": False, "reason": e.reason,
+             "message": "set a clean reference and sink area from the dashboard"},
+            status_code=409,
+        )
+
+    metrics.observe("dishwatcher_ssim_score", result["ssim_score"])
+    metrics.observe("dishwatcher_detector_latency_seconds", result["inference_ms"] / 1000.0)
+    metrics.inc("dishwatcher_detections_total",
+                outcome="dirty" if result["dishes_found"] else "clean")
+    if not result["labels"]:
+        metrics.inc("dishwatcher_empty_labels_total")
+    metrics.gauge("dishwatcher_calibration_valid", 1)
 
     state_label = sm.state.value
     if sm.grace_remaining is not None:
         mins = int(sm.grace_remaining.total_seconds() / 60)
         state_label += f" ({mins}m)"
 
-    annotated = detector.annotate_frame(img, result, state_label=state_label)
+    annotated = detector.annotate_frame(img, result, roi=calib.roi, state_label=state_label)
     quality = config.get("jpeg_quality", 90)
     img_filename = storage.save_frame(annotated, result["dishes_found"],
                                        state=sm.state.value, quality=quality)
@@ -379,8 +1075,25 @@ async def upload_frame(
         "consensus": sm_result["consensus"],
         "grace_remaining": sm_result["grace_remaining"],
         "dishes_since": sm_result["dishes_since"],
-        "has_reference": result["has_reference"],
+        "calibration": calib.state().as_dict(),
+        "ssim_tiles": result.get("ssim_tiles", []),
+        "ssim_threshold": config.get("ssim_threshold", 0.82),
     }
+    LAST_DETECTION.clear()
+    LAST_DETECTION.update({
+        "at": datetime.utcnow().isoformat(),
+        "ssim_score": result["ssim_score"],
+        "ssim_tiles": result.get("ssim_tiles", []),
+        "labels": result["labels"],
+        "inference_ms": result["inference_ms"],
+        "image_file": img_filename,
+    })
+    if sm_result["changed"]:
+        pretty = {"CLEAR": "sink is clear", "CONFIRMED": "dishes confirmed",
+                  "ALERTED": "grace period expired"}.get(sm_result["state"], sm_result["state"])
+        record_event("dirty" if sm_result["state"] == "CONFIRMED" else
+                     "alert" if sm_result["state"] == "ALERTED" else "info", pretty)
+
     await broadcaster.publish("detection", sse_payload)
 
     if sm_result["changed"]:
@@ -409,7 +1122,9 @@ async def upload_frame(
         "consensus": sm_result["consensus"],
         "grace_remaining": sm_result["grace_remaining"],
         "dishes_since": sm_result["dishes_since"],
-        "has_reference": result["has_reference"],
+        "calibration": calib.state().as_dict(),
+        "ssim_tiles": result.get("ssim_tiles", []),
+        "ssim_threshold": config.get("ssim_threshold", 0.82),
     })
 
 

@@ -1,0 +1,138 @@
+/* TigerHub design tokens.
+ *
+ * Generated from the app's own ColorScheme, not transcribed by hand. One seed,
+ * #F76902, expanded by Material 3's algorithm into a full light and dark set,
+ * so every role is already in harmony with every other one.
+ *
+ * Drop this in, then use the variables. Nothing else here depends on Flutter.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  /* --- palette, light --- */
+  --primary: #8d4e2c;
+  --on-primary: #ffffff;
+  --primary-container: #ffdbcc;
+  --on-primary-container: #703717;
+  --secondary: #765749;
+  --tertiary: #655f31;
+  --error: #ba1a1a;
+  --surface: #fff8f6;
+  --surface-container-lowest: #ffffff;
+  --surface-container-low: #fff1eb;
+  --surface-container: #fceae3;
+  --surface-container-high: #f6e5de;
+  --surface-container-highest: #f0dfd8;
+  --on-surface: #221a16;
+  --on-surface-variant: #52443d;
+  --outline: #85736c;
+  --outline-variant: #d7c2b9;
+  --ok: #589b44;
+  --on-ok: #073900;
+  --ok-container: #adf592;
+  --bad: #782f28;
+  --bad-container: #ffdad5;
+  --warn: #996100;
+  --on-warn: #462a00;
+  --warn-container: #ffddb7;
+
+  /* --- shape. Nothing in the system is rounded at 8 or below. --- */
+  --radius-card: 30px;
+  --radius-inner: 20px;
+  --radius-small: 14px;
+  --radius-pill: 999px;
+
+  /* --- spacing --- */
+  --pad-card: 26px;
+  --gutter: 10px;
+
+  /* --- type. Rubik, variable weight axis. --- */
+  --font: 'Rubik', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --weight-light: 300;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* --- motion. Everything is ease-out; nothing bounces. --- */
+  --motion-swap-out: 140ms;
+  --motion-swap-in: 180ms;
+  --motion-value: 260ms;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+
+  /* --- categorical, for charts and map-style category coding.
+     Validated for colourblind separation: worst adjacent pair dE 18.8
+     deuteranopia in light, 19.7 protanopia in dark. Assign in this fixed
+     order and never cycle; a 9th series folds into "Other". --- */
+  --cat-1: #0069a8;
+  --cat-2: #6a4c93;
+  --cat-3: #b4531f;
+  --cat-4: #4f7a28;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --primary: #ffb693;
+    --on-primary: #542104;
+    --primary-container: #703717;
+    --on-primary-container: #ffdbcc;
+    --secondary: #e6beac;
+    --tertiary: #d0c890;
+    --error: #ffb4ab;
+    --surface: #1a120e;
+    --surface-container-lowest: #140c09;
+    --surface-container-low: #221a16;
+    --surface-container: #271e1a;
+    --surface-container-high: #322824;
+    --surface-container-highest: #3d332e;
+    --on-surface: #f0dfd8;
+    --on-surface-variant: #d7c2b9;
+    --outline: #a08d85;
+    --outline-variant: #52443d;
+    --ok: #8bd376;
+    --on-ok: #abf594;
+    --ok-container: #054900;
+    --bad: #c46a61;
+    --bad-container: #820008;
+    --warn: #ffddb7;
+    --on-warn: #ffddb7;
+    --warn-container: #583600;
+    --cat-1: #3d8dc4;
+    --cat-2: #8a6cc0;
+    --cat-3: #cc6a38;
+    --cat-4: #669440;
+  }
+}
+
+:root[data-theme='dark'] {
+  --primary: #ffb693;
+  --on-primary: #542104;
+  --primary-container: #703717;
+  --on-primary-container: #ffdbcc;
+  --secondary: #e6beac;
+  --tertiary: #d0c890;
+  --error: #ffb4ab;
+  --surface: #1a120e;
+  --surface-container-lowest: #140c09;
+  --surface-container-low: #221a16;
+  --surface-container: #271e1a;
+  --surface-container-high: #322824;
+  --surface-container-highest: #3d332e;
+  --on-surface: #f0dfd8;
+  --on-surface-variant: #d7c2b9;
+  --outline: #a08d85;
+  --outline-variant: #52443d;
+  --ok: #8bd376;
+  --on-ok: #abf594;
+  --ok-container: #054900;
+  --bad: #c46a61;
+  --bad-container: #820008;
+  --warn: #ffddb7;
+  --on-warn: #ffddb7;
+  --warn-container: #583600;
+  --cat-1: #3d8dc4;
+  --cat-2: #8a6cc0;
+  --cat-3: #cc6a38;
+  --cat-4: #669440;
+}

@@ -1,167 +1,150 @@
-<!DOCTYPE html>
-<html lang="en">
+<!doctype html>
+<html lang="en" data-theme="dark">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#08090a">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
 <title>dishwatcher</title>
-<link rel="icon" href="/icon.png" type="image/png">
 <link rel="stylesheet" href="/static/style.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 </head>
 <body>
 
-<div class="wrap">
-
-  <div class="topbar">
-    <div class="logo">dishwatcher <span>v5</span></div>
-    <div class="topbar-spacer"></div>
-    <div class="conn"><div class="dot" id="dot"></div><span id="connTxt">...</span></div>
-    <button class="tbtn" id="notifyBtn" onclick="toggleNotify()">notify</button>
-    <button class="tbtn" id="soundBtn" onclick="toggleSound()">sound</button>
-    <button class="tbtn" onclick="showPanel('panelSettings',document.getElementById('navSettings'))">settings</button>
+<div class="topbar">
+  <div class="brand">
+    <h1>dishwatcher</h1>
+    <span class="ver" id="ver">v2</span>
   </div>
-
-  <div class="hero">
-    <div class="orb CLEAR" id="orb">&#x2713;</div>
-    <div>
-      <h1 id="stateTitle">connecting...</h1>
-      <p id="stateSub">waiting for data</p>
-    </div>
-  </div>
-
-  <div class="meter"><div class="meter-fill" id="meterFill" style="width:100%;background:var(--green)"></div></div>
-  <div class="meter-labels"><span>dirty</span><span id="ssimVal">SSIM --</span><span>clean</span></div>
-
-  <div class="grid">
-
-    <div class="panel on" id="panelFeed">
-      <div class="card">
-        <div class="card-h">
-          <span class="card-t">live feed</span>
-          <span class="badge" id="feedMode">--</span>
-        </div>
-        <div class="feed" id="feed" onclick="openLb(feedImg.src)">
-          <div class="feed-empty" id="feedEmpty">waiting for first frame<br><small>make sure the pi is running</small></div>
-          <img id="feedImg" style="display:none">
-          <div class="feed-bar" id="feedBar" style="display:none">
-            <span id="feedMs">--</span>
-            <span id="feedTime">--</span>
-          </div>
-        </div>
-        <button class="ref-btn" id="refBtn" onclick="setReference()">set clean reference</button>
-
-        <div class="vplayer" id="vplayer">
-          <video id="vplayerVid" controls playsinline></video>
-        </div>
-      </div>
-
-      <div class="card" style="margin-top:12px">
-        <div class="card-h">
-          <span class="card-t">timeline</span>
-          <div style="display:flex;gap:6px">
-            <button class="badge" style="cursor:pointer;border:none" onclick="loadTimeline('all')" id="tlAll">all</button>
-            <button class="badge" style="cursor:pointer;border:none" onclick="loadTimeline('videos')" id="tlVids">videos</button>
-          </div>
-        </div>
-        <div class="timeline" id="timeline"></div>
-      </div>
-
-      <div class="card" style="margin-top:12px">
-        <div class="card-h"><span class="card-t">detection chart (24h)</span></div>
-        <div class="chart-box"><canvas id="chart"></canvas></div>
-      </div>
-    </div>
-
-    <div class="panel on" id="panelStatus">
-
-      <div class="card">
-        <div class="card-h"><span class="card-t">consensus buffer</span><span class="badge" id="cRatio">0/0</span></div>
-        <div class="consensus" id="cDots"></div>
-        <div class="meter"><div class="meter-fill" id="cFill" style="width:0;background:var(--green)"></div></div>
-        <div class="meter-labels"><span>confidence</span><span id="cPct">0%</span></div>
-      </div>
-
-      <div class="card" style="margin-top:12px">
-        <div class="card-h"><span class="card-t">grace timer</span><span class="badge" id="timerBadge">inactive</span></div>
-        <div class="timer" id="timerVal">--:--</div>
-        <div class="timer-sub" id="timerSub">no active timer</div>
-      </div>
-
-      <div class="card" style="margin-top:12px">
-        <div class="card-h"><span class="card-t">stats</span></div>
-        <div class="sgrid">
-          <div class="sbox"><div class="sbox-l">frames today</div><div class="sbox-v" id="sFrames">0</div></div>
-          <div class="sbox"><div class="sbox-l">dish rate</div><div class="sbox-v" id="sRate">0%</div></div>
-          <div class="sbox"><div class="sbox-l">avg ssim</div><div class="sbox-v sm" id="sSsim">--</div></div>
-          <div class="sbox"><div class="sbox-l">total alerts</div><div class="sbox-v" id="sAlerts">0</div></div>
-        </div>
-      </div>
-
-      <div class="card" style="margin-top:12px">
-        <div class="card-h"><span class="card-t">state events</span><span class="badge" id="evtCount">0</span></div>
-        <div class="elist" id="evtList"></div>
-      </div>
-
-      <div class="card" style="margin-top:12px">
-        <div class="card-h"><span class="card-t">admin</span></div>
-        <div class="admin-bar" style="display:flex;gap:6px;flex-wrap:wrap">
-          <button class="abtn" onclick="setReference()">set reference</button>
-          <button class="abtn" onclick="adminPost('/admin/auto-detect-sink')">detect sink</button>
-          <button class="abtn" onclick="adminPost('/admin/force-state?state=CLEAR')">force clear</button>
-          <button class="abtn warn" onclick="adminPost('/admin/force-state?state=ALERTED')">force alert</button>
-          <button class="abtn" onclick="adminPost('/admin/test-notify')">test notify</button>
-        </div>
-      </div>
-
-    </div>
-
-    <div class="panel" id="panelSettings">
-      <div class="card">
-        <div class="card-h"><span class="card-t">settings</span></div>
-
-        <div id="settingsLock" style="text-align:center;padding:20px 0">
-          <p style="font-size:.82rem;color:var(--tx-2);margin-bottom:12px">enter admin password to access settings</p>
-          <div style="display:flex;gap:8px;max-width:300px;margin:0 auto">
-            <input type="password" id="settingsPw" placeholder="password"
-              style="flex:1;padding:8px 12px;border-radius:var(--r-sm);border:1px solid var(--bd);background:var(--bg-2);color:var(--tx-0);font-family:var(--mono);font-size:.82rem"
-              onkeydown="if(event.key==='Enter')unlockSettings()">
-            <button class="abtn" onclick="unlockSettings()">unlock</button>
-          </div>
-        </div>
-
-        <div id="settingsBody" style="display:none">
-          <div id="settingsGroups"></div>
-          <div style="margin-top:16px;display:flex;gap:8px">
-            <button class="abtn" onclick="saveSettings()" style="flex:1;padding:10px;font-size:.78rem">save changes</button>
-            <button class="abtn" onclick="loadSettings()">reset</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
+  <div class="topbar-actions">
+    <span class="pill pill-mute" id="conn"><span class="dot"></span>connecting</span>
+    <button id="theme" title="Toggle theme">theme</button>
   </div>
 </div>
 
-<div class="toasts" id="toasts"></div>
-<div class="lb" id="lb" onclick="closeLb()"><img id="lbImg"><video id="lbVid" controls playsinline style="display:none"></div>
+<!-- The calibration banner. v1's entire failure was that this state was
+     invisible: it reported a clean sink while uncalibrated for 15 days. -->
+<div class="banner" id="calib-banner" hidden>
+  <div class="icon">!</div>
+  <div>
+    <h3>Not calibrated - detection is off</h3>
+    <p>Clean the sink, then set a reference and draw the sink area. Until then
+       nothing is being watched.</p>
+    <div class="reason" id="calib-reason"></div>
+  </div>
+</div>
 
-<nav class="bnav">
-  <button class="bnav-btn on" onclick="showPanel('panelFeed',this)" id="navFeed">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-    feed
-  </button>
-  <button class="bnav-btn" onclick="showPanel('panelStatus',this)" id="navStatus">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-    status
-  </button>
-  <button class="bnav-btn" onclick="showPanel('panelSettings',this)" id="navSettings">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
-    settings
-  </button>
-</nav>
+<div class="grid">
+
+  <!-- hero card: one question, "is the sink dirty and for how long" -->
+  <div class="card">
+    <h2>Sink</h2>
+    <div class="hero state-unknown" id="hero">
+      <span class="value skeleton" id="state-value">----</span>
+      <div class="label" id="state-label">state</div>
+    </div>
+    <div class="readings" style="margin-top:20px">
+      <div class="reading"><span class="k">Since</span><span class="v skeleton" id="since">--</span></div>
+      <div class="reading"><span class="k">Alert in</span><span class="v skeleton" id="alert-in">--</span></div>
+      <div class="reading"><span class="k">Agreement</span><span class="v skeleton" id="consensus">--</span></div>
+    </div>
+  </div>
+
+  <!-- detector card -->
+  <div class="card">
+    <h2>Detector</h2>
+    <div class="hero" id="ssim-hero">
+      <span class="value skeleton" id="ssim-value">----</span>
+      <div class="label">worst region similarity</div>
+    </div>
+    <div class="readings" style="margin-top:20px">
+      <div class="reading"><span class="k">Threshold</span><span class="v" id="threshold">--</span></div>
+      <div class="reading"><span class="k">Sees</span><span class="v" id="labels">--</span></div>
+      <div class="reading"><span class="k">Took</span><span class="v" id="latency">--</span></div>
+    </div>
+  </div>
+
+  <!-- where the change is -->
+  <div class="card">
+    <h2>Change map</h2>
+    <div class="heat" id="heat"></div>
+    <div class="stale" id="heat-note">darker means more different from clean</div>
+  </div>
+
+  <!-- camera health: the wedge detector -->
+  <div class="card">
+    <h2>Camera</h2>
+    <div class="readings">
+      <div class="reading"><span class="k">Link</span><span class="v" id="cam-link">--</span></div>
+      <div class="reading"><span class="k">Last frame</span><span class="v" id="cam-last">--</span></div>
+      <div class="reading"><span class="k">Reopens</span><span class="v" id="cam-reopens">--</span></div>
+      <div class="reading"><span class="k">Motion</span><span class="v" id="cam-motion">--</span></div>
+      <div class="reading"><span class="k">Flap ratio</span><span class="v" id="cam-flap">--</span></div>
+    </div>
+  </div>
+
+  <!-- latest frame -->
+  <div class="card wide">
+    <h2 id="view-title">Latest capture</h2>
+    <div class="viewport">
+      <img class="frame" id="frame" alt="latest sink capture">
+      <img class="frame" id="live" alt="live camera view" hidden>
+      <span class="pill pill-bad live-badge" id="live-badge" hidden><span class="dot"></span>LIVE</span>
+      <!-- drag-to-draw sink area, over the real frame -->
+      <canvas id="roi-canvas" hidden></canvas>
+      <div class="roi-hint" id="roi-hint" hidden>Drag a box around the sink basins</div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap">
+      <button id="live-toggle">Live view</button>
+      <button class="primary" id="set-ref">Set clean reference</button>
+      <button id="set-roi">Draw sink area</button>
+      <button id="roi-save" hidden class="primary">Save area</button>
+      <button id="roi-cancel" hidden>Cancel</button>
+      <button class="danger" id="clear-calib">Clear calibration</button>
+    </div>
+    <div class="stale" id="frame-age"></div>
+  </div>
+
+  <!-- what the detector thinks "clean" looks like -->
+  <div class="card wide">
+    <h2>Clean reference</h2>
+    <p class="stale" style="text-align:left;padding:0 0 14px">
+      This is what the sink is compared against. Anything left in here is
+      treated as normal forever, so check it before you trust a result.
+    </p>
+    <div class="refgrid">
+      <img class="frame refimg" id="ref-full" alt="stored reference frame">
+      <img class="frame refimg" id="ref-roi" alt="sink area of the reference, magnified">
+    </div>
+    <div class="stale" id="ref-note"></div>
+  </div>
+
+  <!-- roommates -->
+  <div class="card wide">
+    <h2>Roommates</h2>
+    <div class="roster" id="roster"></div>
+    <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+      <input id="new-name" class="text-in" placeholder="Name" maxlength="60">
+      <button class="primary" id="add-person">Add roommate</button>
+    </div>
+  </div>
+
+  <!-- blame clips -->
+  <div class="card wide">
+    <h2>Blame clips</h2>
+    <p class="stale" style="text-align:left;padding:0 0 14px">
+      Recorded when someone walks away from the sink. Tag one to say who it was.
+    </p>
+    <div class="clips" id="clips"><div class="empty">No clips yet</div></div>
+  </div>
+
+  <!-- events -->
+  <div class="card wide">
+    <h2>Recent events</h2>
+    <div class="events" id="events">
+      <div class="empty">No events yet</div>
+    </div>
+  </div>
+
+</div>
 
 <script src="/static/app.js"></script>
 </body>

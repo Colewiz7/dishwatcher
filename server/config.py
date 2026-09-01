@@ -47,6 +47,11 @@ SCHEMA = {
     "ui_show_stats":        {"default": True,   "type": "bool",  "group": "ui", "label": "show stats panel"},
     "ui_show_events":       {"default": True,   "type": "bool",  "group": "ui", "label": "show event log"},
 
+    # retention. These are blame clips: video of people in a home. v1 kept
+    # everything forever and its own TODO admitted it.
+    "clip_retention_days":  {"default": 14, "type": "int", "min": 1, "max": 365, "step": 1, "group": "retention", "label": "keep clips (days)", "desc": "blame clips older than this are deleted"},
+    "image_retention_days": {"default": 30, "type": "int", "min": 1, "max": 365, "step": 1, "group": "retention", "label": "keep frames (days)"},
+
     # admin
     "admin_password":       {"default": "",     "type": "password", "group": "admin", "label": "dashboard password", "desc": "leave empty to disable"},
 }
@@ -67,6 +72,8 @@ _ENV_MAP = {
     "DISCORD_MENTION": "discord_mention",
     "NOTIFY_COOLDOWN_MIN": "notify_cooldown_min",
     "ADMIN_PASSWORD": "admin_password",
+    "CLIP_RETENTION_DAYS": "clip_retention_days",
+    "IMAGE_RETENTION_DAYS": "image_retention_days",
 }
 
 
