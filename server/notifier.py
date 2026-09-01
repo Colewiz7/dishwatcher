@@ -31,6 +31,12 @@ NTFY_CLICK     = os.environ.get("NTFY_CLICK", "")
 # ntfy here is deny-all by default with tokens created out of band, so
 # publishing without one gets a 403. Same token Alertmanager already uses.
 NTFY_TOKEN     = os.environ.get("NTFY_TOKEN", "")
+# Off by default, and not only because this ntfy has attachments disabled.
+# Attaching the frame would push a picture of the kitchen through a publicly
+# reachable service, which is exactly what "photos never go online" rules out.
+# The notification links to the dashboard instead, where the frame is served
+# only on the local network.
+NTFY_ATTACH_IMAGE = os.environ.get("NTFY_ATTACH_IMAGE", "false").lower() == "true"
 _NTFY_TOKEN_FILE = os.environ.get("NTFY_TOKEN_FILE", "")
 if not NTFY_TOKEN and _NTFY_TOKEN_FILE and os.path.isfile(_NTFY_TOKEN_FILE):
     NTFY_TOKEN = open(_NTFY_TOKEN_FILE).read().strip()
@@ -113,17 +119,27 @@ def send_ntfy(message, image_path=None, title="Dishes in the sink",
     if NTFY_CLICK:
         headers["Click"] = NTFY_CLICK
 
-    try:
-        if image_path and os.path.isfile(image_path):
-            # image as the body; the text rides along in a header
-            headers["Filename"] = os.path.basename(image_path)
-            headers["Message"] = message
-            with open(image_path, "rb") as f:
-                r = _sess().put(url, data=f, headers=headers, timeout=20)
-        else:
-            r = _sess().post(url, data=message.encode("utf-8"),
-                             headers=headers, timeout=15)
+    def _post_text():
+        r = _sess().post(url, data=message.encode("utf-8"), headers=headers, timeout=15)
         r.raise_for_status()
+        return r
+
+    try:
+        if NTFY_ATTACH_IMAGE and image_path and os.path.isfile(image_path):
+            attach = dict(headers)
+            attach["Filename"] = os.path.basename(image_path)
+            attach["Message"] = message
+            try:
+                with open(image_path, "rb") as f:
+                    r = _sess().put(url, data=f, headers=attach, timeout=20)
+                r.raise_for_status()
+            except Exception as e:
+                # a server with attachments disabled answers 40014; the alert
+                # still matters, so send it as text rather than dropping it
+                log.info("ntfy attachment rejected (%s), sending text only", e)
+                _post_text()
+        else:
+            _post_text()
         log.info("ntfy: %s", message)
         return True
     except Exception as e:
