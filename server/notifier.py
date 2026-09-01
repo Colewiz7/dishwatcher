@@ -28,6 +28,12 @@ NTFY_PRIORITY  = os.environ.get("NTFY_PRIORITY", "default")
 # Where the notification should take you when tapped. Deliberately the public
 # hostname, since that is what resolves from a phone off the home network.
 NTFY_CLICK     = os.environ.get("NTFY_CLICK", "")
+# ntfy here is deny-all by default with tokens created out of band, so
+# publishing without one gets a 403. Same token Alertmanager already uses.
+NTFY_TOKEN     = os.environ.get("NTFY_TOKEN", "")
+_NTFY_TOKEN_FILE = os.environ.get("NTFY_TOKEN_FILE", "")
+if not NTFY_TOKEN and _NTFY_TOKEN_FILE and os.path.isfile(_NTFY_TOKEN_FILE):
+    NTFY_TOKEN = open(_NTFY_TOKEN_FILE).read().strip()
 DISCORD_MENTION = os.environ.get("DISCORD_MENTION", "")
 COOLDOWN_MIN    = float(os.environ.get("NOTIFY_COOLDOWN_MIN", "30"))
 
@@ -102,6 +108,8 @@ def send_ntfy(message, image_path=None, title="Dishes in the sink",
         "Priority": priority or NTFY_PRIORITY,
         "Tags": tags,
     }
+    if NTFY_TOKEN:
+        headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
     if NTFY_CLICK:
         headers["Click"] = NTFY_CLICK
 
