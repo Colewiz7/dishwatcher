@@ -935,9 +935,11 @@ function renderClips(clips) {
         month: "short",
         day: "numeric",
       });
-      const detail = document.createElement("small");
-      detail.textContent = c.session_id ? "Cooking session" : "Sink visits";
-      heading.append(detail);
+      if (!c.session_id) {
+        const detail = document.createElement("small");
+        detail.textContent = "Sink visits";
+        heading.append(detail);
+      }
       el.append(heading);
       previousGroup = group;
     }
