@@ -81,6 +81,19 @@ def test_clip_list_keeps_storage_thumbnail_url(srv, monkeypatch):
 
 def test_dashboard_uses_generated_sink_favicon(srv):
     html = request(srv, "/", headers=BASIC).text
+    from html.parser import HTMLParser
+    class BrandParser(HTMLParser):
+        found = False
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "img" and attrs.get("class") == "brand-mark":
+                assert attrs["src"] == "/static/sink-touch-icon-v2.png"
+                assert attrs["alt"] == ""  # Home link already has an accessible name.
+                assert attrs["width"] == attrs["height"] == "48"
+                self.found = True
+    parser = BrandParser()
+    parser.feed(html)
+    assert parser.found
     for name in ("sink-favicon-v2.ico", "sink-favicon-v2.png", "sink-touch-icon-v2.png"):
         assert f'/static/{name}' in html
         result = request(srv, f"/static/{name}", headers=BASIC)
