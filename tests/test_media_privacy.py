@@ -79,6 +79,18 @@ def test_clip_list_keeps_storage_thumbnail_url(srv, monkeypatch):
     assert clip["url"] == "/videos/clip.mp4"
 
 
+def test_dashboard_uses_generated_sink_favicon(srv):
+    html = request(srv, "/", headers=BASIC).text
+    for name in ("sink-favicon-v2.ico", "sink-favicon-v2.png", "sink-touch-icon-v2.png"):
+        assert f'/static/{name}' in html
+        result = request(srv, f"/static/{name}", headers=BASIC)
+        assert result.status_code == 200
+        assert result.headers["content-type"].startswith("image/")
+        assert 100 < len(result.content) < 50000
+    icon = request(srv, "/static/sink-favicon-v2.ico", headers=BASIC).content
+    assert icon[:6] == b"\x00\x00\x01\x00\x04\x00"  # four icon resolutions
+
+
 def test_clip_filters_apply_before_pagination(srv, monkeypatch):
     monkeypatch.setattr(srv.storage, "list_videos", lambda limit: [
         {"filename": "20260916_120000_blame.mp4"},
