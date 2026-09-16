@@ -1156,8 +1156,19 @@ function navigate() {
   $("all-clips").hidden = currentView !== "overview";
   renderClips(clipsCache);
   if (snapshot) render(snapshot, false);
+  window.scrollTo({ top: 0, behavior: "instant" });
 }
 window.addEventListener("hashchange", navigate);
+// These hashes are app pages, not anchors into a long gallery.
+document.querySelectorAll('a[href^="#"]').forEach((link) => {
+  if (!viewCopy[link.hash.slice(1)]) return;
+  link.addEventListener("click", (event) => {
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    if (location.hash === link.hash) navigate();
+    else location.hash = link.hash;
+  });
+});
 document.querySelectorAll("[data-filter]").forEach(
   (btn) =>
     (btn.onclick = () => {
