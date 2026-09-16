@@ -18,6 +18,94 @@ let currentView = "overview";
 let clipsCache = [];
 let clipFilter = "all";
 let clipLimit = 40;
+let clipDays = [];
+let clipBaseOffset = 0;
+let clipNextOffset = 0;
+let clipScrollFrame = 0;
+
+function clipDateLabel(day) {
+  return new Date(day + "T12:00:00").toLocaleDateString([], {
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function updateClipDatePosition() {
+  clipScrollFrame = 0;
+  if (currentView !== "clips") return;
+  const headings = [...document.querySelectorAll("#clips [data-clip-day]")];
+  let day = headings[0]?.dataset.clipDay;
+  const threshold = window.innerWidth <= 760 ? 110 : 100;
+  for (const heading of headings) {
+    if (heading.getBoundingClientRect().top > threshold) break;
+    day = heading.dataset.clipDay;
+  }
+  for (const button of document.querySelectorAll(".clip-date-link")) {
+    const active = button.dataset.day === day;
+    const changed = active && !button.hasAttribute("aria-current");
+    if (active) button.setAttribute("aria-current", "date");
+    else button.removeAttribute("aria-current");
+    if (changed) {
+      const rail = $("clip-dates");
+      const box = button.getBoundingClientRect(),
+        parent = rail.getBoundingClientRect();
+      if (window.innerWidth <= 760) {
+        if (box.left < parent.left || box.right > parent.right)
+          rail.scrollLeft += box.left - parent.left;
+      } else if (box.top < parent.top || box.bottom > parent.bottom) {
+        rail.scrollTop += box.top - parent.top;
+      }
+    }
+  }
+}
+
+function renderClipDates() {
+  const show = currentView === "clips" && clipDays.length > 0;
+  $("clip-date-rail").hidden = !show;
+  $("clip-browser").classList.toggle("with-rail", show);
+  const nav = $("clip-dates");
+  const signature = JSON.stringify(clipDays);
+  if (nav.dataset.sig !== signature) {
+    nav.dataset.sig = signature;
+    nav.replaceChildren();
+    for (const entry of clipDays) {
+      const button = document.createElement("button");
+      button.className = "clip-date-link";
+      button.dataset.day = entry.date.replaceAll("-", "");
+      button.setAttribute(
+        "aria-label",
+        `${clipDateLabel(entry.date)}, ${entry.count} clips`,
+      );
+      button.append(document.createTextNode(clipDateLabel(entry.date)));
+      const count = document.createElement("small");
+      count.textContent = entry.count;
+      button.append(count);
+      button.onclick = async () => {
+        if (clipsLoading) return;
+        const key = button.dataset.day;
+        let heading = document.querySelector(`#clips [data-clip-day="${key}"]`);
+        if (!heading || entry.offset < clipBaseOffset) {
+          const loaded = await loadClips(false, entry.offset);
+          if (!loaded) return;
+          heading = document.querySelector(`#clips [data-clip-day="${key}"]`);
+        }
+        heading?.scrollIntoView({ block: "start", behavior: "instant" });
+        updateClipDatePosition();
+      };
+      nav.append(button);
+    }
+  }
+  updateClipDatePosition();
+}
+
+window.addEventListener(
+  "scroll",
+  () => {
+    if (!clipScrollFrame)
+      clipScrollFrame = requestAnimationFrame(updateClipDatePosition);
+  },
+  { passive: true },
+);
 let clipsTotal = 0,
   clipsHasMore = false,
   clipRequest = 0,
@@ -805,8 +893,12 @@ function renderClips(clips) {
   const visible = currentView === "overview" ? filtered.slice(0, 6) : filtered;
   setText("clip-count", clipsTotal, { animate: false });
   $("clip-results").textContent =
-    `Showing ${visible.length} of ${clipsTotal} matching clips · kept for 14 days`;
+    `${clipBaseOffset ? "Viewing from " + clipDateLabel(clipDays.find((d) => d.offset <= clipBaseOffset && d.offset + d.count > clipBaseOffset)?.date || new Date().toISOString().slice(0, 10)) + " · " : ""}${visible.length} loaded of ${clipsTotal} matching clips · kept for 14 days`;
   $("more-clips").hidden = currentView !== "clips" || !clipsHasMore;
+  $("newer-clips").hidden = currentView !== "clips" || !clipBaseOffset;
+  $("clip-end-note").hidden =
+    currentView !== "clips" || clipsHasMore || !clipsTotal;
+  renderClipDates();
   const el = $("clips");
   const sig = JSON.stringify([currentView, clipFilter, visible]);
   if (el.dataset.sig === sig) return;
@@ -821,12 +913,17 @@ function renderClips(clips) {
     return;
   }
   let previousGroup = null;
+  const headingDays = new Set();
   for (const c of visible) {
     const day = c.filename.slice(0, 8);
     const group = day + ":" + (c.session_id || "visits");
     if (group !== previousGroup) {
       const heading = document.createElement("h3");
       heading.className = "clip-group";
+      if (!headingDays.has(day)) {
+        heading.dataset.clipDay = day;
+        headingDays.add(day);
+      }
       const date = new Date(
         Number(day.slice(0, 4)),
         Number(day.slice(4, 6)) - 1,
@@ -888,6 +985,7 @@ function renderClips(clips) {
     card.append(preview, meta);
     el.append(card);
   }
+  updateClipDatePosition();
 }
 
 function openClip(clip, keepQueue = false) {
@@ -1041,16 +1139,27 @@ async function loadPeople() {
   }
 }
 
-async function loadClips(append = false) {
+async function loadClips(append = false, offset = 0) {
   if (append && clipsLoading) return;
   const request = ++clipRequest;
+  const start = $("clip-start").value,
+    end = $("clip-end").value;
+  if (start && end && start > end) {
+    $("clips-error").textContent =
+      "Choose a From date on or before the Through date.";
+    $("clips-error").hidden = false;
+    clipsLoading = false;
+    $("more-clips").disabled = false;
+    return false;
+  }
   clipsLoading = true;
   $("more-clips").disabled = true;
   const params = new URLSearchParams({
     limit: String(clipLimit),
-    offset: String(append ? clipsCache.length : 0),
+    offset: String(append ? clipNextOffset : offset),
   });
-  if ($("clip-day").value) params.set("day", $("clip-day").value);
+  if (start) params.set("start_date", start);
+  if (end) params.set("end_date", end);
   if ($("clip-person-filter").value)
     params.set("person", $("clip-person-filter").value);
   if (clipFilter !== "all")
@@ -1065,14 +1174,19 @@ async function loadClips(append = false) {
     if (request !== clipRequest) return;
     clipsTotal = d.total ?? (d.clips || []).length;
     clipsHasMore = !!d.has_more;
+    clipDays = d.days || [];
+    if (!append) clipBaseOffset = d.offset || 0;
+    clipNextOffset = (d.offset || 0) + (d.clips || []).length;
     const merged = append ? [...clipsCache, ...(d.clips || [])] : d.clips || [];
     renderClips([...new Map(merged.map((c) => [c.filename, c])).values()]);
     $("clips-error").hidden = true;
+    return true;
   } catch (e) {
     if (request !== clipRequest) return;
     $("clips-error").textContent =
       "Couldn’t refresh clips. Your last results are still here. Try Refresh.";
     $("clips-error").hidden = false;
+    return false;
   } finally {
     if (request === clipRequest) {
       clipsLoading = false;
@@ -1347,10 +1461,42 @@ document.querySelectorAll("[data-filter]").forEach(
 );
 $("refresh-clips").onclick = () => loadClips();
 $("more-clips").onclick = () => loadClips(true);
-$("clip-day").onchange = () => loadClips();
+$("newer-clips").onclick = async () => {
+  if (await loadClips()) $("clips-section").scrollIntoView({ block: "start" });
+};
+$("clip-start").onchange = () => loadClips();
+$("clip-end").onchange = () => loadClips();
+document.querySelectorAll("[data-range]").forEach((button) => {
+  button.onclick = () => {
+    const end = new Date(),
+      start = new Date();
+    start.setDate(start.getDate() - Number(button.dataset.range) + 1);
+    const localDate = (d) =>
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    $("clip-start").value = localDate(start);
+    $("clip-end").value = localDate(end);
+    loadClips();
+  };
+});
+const olderClipsObserver = new IntersectionObserver(
+  (entries) => {
+    if (
+      entries.some((entry) => entry.isIntersecting) &&
+      currentView === "clips" &&
+      clipsHasMore &&
+      !clipsLoading &&
+      !$("clip-dialog").open &&
+      $("clips-error").hidden
+    )
+      loadClips(true);
+  },
+  { rootMargin: "400px 0px" },
+);
+olderClipsObserver.observe($("more-clips"));
 $("clip-person-filter").onchange = () => loadClips();
 $("clear-clip-filters").onclick = () => {
-  $("clip-day").value = "";
+  $("clip-start").value = "";
+  $("clip-end").value = "";
   $("clip-person-filter").value = "";
   document.querySelector('[data-filter="all"]').click();
 };

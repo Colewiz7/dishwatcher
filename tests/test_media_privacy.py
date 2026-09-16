@@ -95,6 +95,38 @@ def test_clip_filters_apply_before_pagination(srv, monkeypatch):
     assert "110000" in result["clips"][0]["filename"]
 
 
+def test_clip_date_range_is_inclusive_and_rail_covers_all_pages(srv, monkeypatch):
+    monkeypatch.setattr(srv.storage, "list_videos", lambda limit: [
+        {"filename": "20260916_120000_blame.mp4"},
+        {"filename": "20260915_120000_blame.mp4"},
+        {"filename": "20260915_110000_blame.mp4"},
+        {"filename": "20260914_120000_blame.mp4"},
+        {"filename": "20260913_120000_blame.mp4"}])
+    monkeypatch.setattr(srv.people, "tag_of", lambda name: None)
+    url = "/clips?start_date=2026-09-14&end_date=2026-09-15&limit=1"
+    result = request(srv, url, headers=BASIC).json()
+    assert result["total"] == 3 and result["has_more"]
+    assert result["days"] == [
+        {"date": "2026-09-15", "count": 2, "offset": 0},
+        {"date": "2026-09-14", "count": 1, "offset": 2}]
+    jump = request(srv, url + "&offset=2", headers=BASIC).json()
+    assert jump["clips"][0]["filename"].startswith("20260914")
+    assert jump["days"] == result["days"] and not jump["has_more"]
+    assert request(srv, "/clips?start_date=2026-09-16", headers=BASIC).json()["total"] == 1
+    assert request(srv, "/clips?end_date=2026-09-13", headers=BASIC).json()["total"] == 1
+    assert request(srv, "/clips?start_date=2026-09-16&end_date=2026-09-14", headers=BASIC).status_code == 422
+    assert request(srv, "/clips?start_date=invalid", headers=BASIC).status_code == 422
+
+
+def test_clip_date_rail_respects_person_and_tag_filters(srv, monkeypatch):
+    monkeypatch.setattr(srv.storage, "list_videos", lambda limit: [
+        {"filename": "20260916_120000_blame.mp4"}, {"filename": "20260915_120000_blame.mp4"}])
+    monkeypatch.setattr(srv.people, "tag_of", lambda name: {"person_id": "a"} if name.startswith("20260915") else None)
+    result = request(srv, "/clips?person=a&tagged=true", headers=BASIC).json()
+    assert result["days"] == [{"date": "2026-09-15", "count": 1, "offset": 0}]
+    assert request(srv, "/clips?person=a&tagged=false", headers=BASIC).json()["days"] == []
+
+
 def test_chunk_upload_is_authenticated_and_does_not_change_detection(srv, monkeypatch):
     import json
     monkeypatch.setattr(srv, "API_KEY", "camera-key")

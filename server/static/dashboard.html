@@ -9,7 +9,7 @@
     <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#1a120e" />
     <title>Dishwatcher · Kitchen</title>
-    <link rel="stylesheet" href="/static/dashboard.css?v=6" />
+    <link rel="stylesheet" href="/static/dashboard.css?v=7" />
   </head>
   <body>
     <a class="skip" href="#main">Skip to content</a>
@@ -192,7 +192,12 @@
           <button class="iconbtn" id="refresh-clips">↻ Refresh</button>
         </div>
         <div class="clip-search">
-          <label>Day <input type="date" id="clip-day" /></label>
+          <label for="clip-start"
+            >From <input type="date" id="clip-start"
+          /></label>
+          <label for="clip-end"
+            >Through <input type="date" id="clip-end"
+          /></label>
           <label
             >Roommate
             <select id="clip-person-filter">
@@ -200,15 +205,34 @@
             </select></label
           >
           <button class="button" id="clear-clip-filters">Clear filters</button>
+        </div>
+        <div class="clip-range-shortcuts" aria-label="Quick date ranges">
+          <button class="filter" data-range="1">Today</button>
+          <button class="filter" data-range="7">Last 7 days</button>
+          <button class="filter" data-range="14">Last 14 days</button>
           <span class="helper" id="clip-results" role="status"></span>
         </div>
         <p id="clips-error" class="error-note" role="status" hidden></p>
-        <div class="clips" id="clips">
-          <div class="empty">Loading your clips…</div>
+        <div class="clip-browser" id="clip-browser">
+          <aside class="clip-date-rail" id="clip-date-rail" hidden>
+            <p class="eyebrow">Jump to a day</p>
+            <nav id="clip-dates" aria-label="Clip dates"></nav>
+          </aside>
+          <div class="clip-feed">
+            <button id="newer-clips" class="load-more" hidden>
+              ↑ Back to newest matching clips
+            </button>
+            <div class="clips" id="clips">
+              <div class="empty">Loading your clips…</div>
+            </div>
+            <button id="more-clips" class="load-more" hidden>
+              Load older clips
+            </button>
+            <p id="clip-end-note" class="helper" hidden>
+              You’re caught up with this date range.
+            </p>
+          </div>
         </div>
-        <button id="more-clips" class="load-more" hidden>
-          Load more clips
-        </button>
       </section>
       <section
         id="household-section"
@@ -390,6 +414,6 @@
       </div>
     </dialog>
     <div id="toast" role="status" hidden></div>
-    <script src="/static/app.js?v=6"></script>
+    <script src="/static/app.js?v=7"></script>
   </body>
 </html>

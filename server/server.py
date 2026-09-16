@@ -516,18 +516,23 @@ async def live_snapshot(after: Optional[str] = Query(default=None, max_length=10
 @app.get("/clips")
 async def list_clips(limit: int = Query(40, ge=1, le=200), offset: int = Query(0, ge=0),
                      day: Optional[date] = None, person: Optional[str] = Query(None, max_length=64),
-                     tagged: Optional[bool] = None):
+                     tagged: Optional[bool] = None, start_date: Optional[date] = None,
+                     end_date: Optional[date] = None):
     """
     Saved blame clips, newest first, with whoever they are attributed to.
 
     The clips were being recorded from the start and there was no way to watch
     one, so they were evidence nobody could read.
     """
-    return JSONResponse(await asyncio.to_thread(_clip_listing, limit, offset, day, person, tagged))
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(422, "Start date must be on or before end date")
+    return JSONResponse(await asyncio.to_thread(_clip_listing, limit, offset, day, person, tagged,
+                                               start_date, end_date))
 
 
-def _clip_listing(limit, offset, day, person, tagged):
+def _clip_listing(limit, offset, day, person, tagged, start_date=None, end_date=None):
     out = []
+    days = {}
     for v in storage.list_videos(limit=None):
         name = v.get("filename") or v.get("name")
         if not name:
@@ -535,10 +540,18 @@ def _clip_listing(limit, offset, day, person, tagged):
         tag = people.tag_of(name)
         if day and not name.startswith(day.strftime("%Y%m%d")):
             continue
+        if start_date and name[:8] < start_date.strftime("%Y%m%d"):
+            continue
+        if end_date and name[:8] > end_date.strftime("%Y%m%d"):
+            continue
         if person and (not tag or tag.get("person_id") != person):
             continue
         if tagged is not None and bool(tag) != tagged:
             continue
+        date_key = f"{name[:4]}-{name[4:6]}-{name[6:8]}"
+        if date_key not in days:
+            days[date_key] = {"date": date_key, "count": 0, "offset": len(out)}
+        days[date_key]["count"] += 1
         out.append({
             **v,
             "url": f"/videos/{name}",
@@ -546,7 +559,8 @@ def _clip_listing(limit, offset, day, person, tagged):
             "tag": tag,
         })
     return {"clips": out[offset:offset + limit], "counts": people.counts(),
-            "total": len(out), "offset": offset, "has_more": offset + limit < len(out)}
+            "total": len(out), "offset": offset, "has_more": offset + limit < len(out),
+            "days": list(days.values())}
 
 
 def _clip_metadata(value):

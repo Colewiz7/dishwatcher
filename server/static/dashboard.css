@@ -220,10 +220,110 @@ h1 {
   max-width: 180px;
 }
 .clip-group {
+  scroll-margin-top: 24px;
   grid-column: 1 / -1;
   font-size: 0.95rem;
   font-weight: 500;
   margin: 14px 0 0;
+}
+.clip-range-shortcuts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+.clip-range-shortcuts .helper {
+  margin-left: auto;
+}
+.clip-browser.with-rail {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+.clip-feed {
+  min-width: 0;
+}
+.clip-date-rail {
+  position: sticky;
+  top: 20px;
+  padding: 16px 10px;
+  border-radius: 20px;
+  background: var(--surface-container-low);
+}
+.clip-date-rail .eyebrow {
+  margin: 0 8px 12px;
+  font-size: 0.65rem;
+}
+#clip-dates {
+  max-height: calc(100dvh - 110px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--primary) transparent;
+}
+.clip-date-link {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 10px;
+  margin: 2px 0;
+  border-radius: 12px;
+  background: transparent;
+  text-align: left;
+  font-size: 0.8rem;
+  color: var(--on-surface-variant);
+}
+.clip-date-link small {
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
+}
+.clip-date-link[aria-current="date"] {
+  background: var(--primary-container);
+  color: var(--on-primary-container);
+}
+.clip-date-link:hover {
+  background: var(--surface-container-high);
+}
+#clip-end-note {
+  text-align: center;
+  padding: 28px 0;
+}
+@media (max-width: 760px) {
+  .clip-browser.with-rail {
+    display: block;
+  }
+  .clip-date-rail {
+    z-index: 3;
+    top: 0;
+    margin-bottom: 16px;
+    padding: 8px;
+    border-radius: 14px;
+    box-shadow: 0 4px 14px #0002;
+  }
+  .clip-date-rail .eyebrow {
+    display: none;
+  }
+  #clip-dates {
+    display: flex;
+    gap: 4px;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .clip-date-link {
+    flex: 0 0 auto;
+    width: auto;
+    white-space: nowrap;
+  }
+  .clip-group {
+    scroll-margin-top: 80px;
+  }
+  .clip-range-shortcuts .helper {
+    width: 100%;
+    margin: 6px 0 0;
+  }
 }
 .clip-group small {
   color: var(--on-surface-variant);
