@@ -126,7 +126,8 @@ def test_live_orientation_matches_snapshot_processing(srv, monkeypatch, rotation
     assert live["seq"] == 1
 
 
-@pytest.mark.parametrize("payload,status", [(b"", 400), (b"not a jpeg", 422), (b"x" * (2 * 1024 * 1024 + 1), 413)])
+@pytest.mark.parametrize("payload,status", [(b"", 400), (b"not a jpeg", 422), (b"x" * (2 * 1024 * 1024 + 1), 413)],
+                         ids=["empty", "invalid-jpeg", "oversized"])
 def test_bad_preview_never_replaces_last_good_frame(srv, monkeypatch, payload, status):
     live = {"wanted_until": 0, "frame": b"last good", "frame_at": 123, "seq": 9}
     monkeypatch.setattr(srv, "LIVE", live)
