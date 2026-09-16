@@ -558,6 +558,14 @@ def _clip_listing(limit, offset, day, person, tagged, start_date=None, end_date=
             "thumb_url": v.get("thumb_url"),
             "tag": tag,
         })
+    # Order session parts before pagination, so loading an older page never
+    # inserts earlier parts above clips the viewer has already watched.
+    sessions = {}
+    for clip in out:
+        key = (clip["filename"][:8], clip.get("session_id") or clip["filename"])
+        sessions.setdefault(key, []).append(clip)
+    out = [clip for group in sessions.values()
+           for clip in sorted(group, key=lambda item: item.get("part") or 0)]
     return {"clips": out[offset:offset + limit], "counts": people.counts(),
             "total": len(out), "offset": offset, "has_more": offset + limit < len(out),
             "days": list(days.values())}

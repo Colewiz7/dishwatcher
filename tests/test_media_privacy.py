@@ -118,6 +118,17 @@ def test_clip_date_range_is_inclusive_and_rail_covers_all_pages(srv, monkeypatch
     assert request(srv, "/clips?start_date=invalid", headers=BASIC).status_code == 422
 
 
+def test_session_parts_are_ordered_before_paging(srv, monkeypatch):
+    monkeypatch.setattr(srv.storage, "list_videos", lambda limit: [
+        {"filename": f"20260916_12000{part}_blame.mp4", "session_id": "s", "part": part}
+        for part in (4, 3, 2, 1)])
+    monkeypatch.setattr(srv.people, "tag_of", lambda name: None)
+    first = request(srv, "/clips?limit=2", headers=BASIC).json()
+    second = request(srv, "/clips?limit=2&offset=2", headers=BASIC).json()
+    assert [c["part"] for c in first["clips"]] == [1, 2]
+    assert [c["part"] for c in second["clips"]] == [3, 4]
+
+
 def test_clip_date_rail_respects_person_and_tag_filters(srv, monkeypatch):
     monkeypatch.setattr(srv.storage, "list_videos", lambda limit: [
         {"filename": "20260916_120000_blame.mp4"}, {"filename": "20260915_120000_blame.mp4"}])

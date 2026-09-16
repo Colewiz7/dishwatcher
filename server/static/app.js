@@ -875,7 +875,8 @@ function renderClips(clips) {
   // Sessions stay newest-first, but their parts play in chronological order.
   const sessions = new Map();
   for (const clip of clips) {
-    const key = clip.session_id || clip.filename;
+    const key =
+      clip.filename.slice(0, 8) + ":" + (clip.session_id || clip.filename);
     if (!sessions.has(key)) sessions.set(key, []);
     sessions.get(key).push(clip);
   }
