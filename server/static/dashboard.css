@@ -197,6 +197,9 @@ h1 {
   color: var(--on-surface-variant);
   font-size: 0.9rem;
 }
+.sink-subtitle {
+  font-weight: 700;
+}
 .date-label {
   color: var(--outline);
   font-size: 0.8rem;

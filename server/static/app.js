@@ -1124,8 +1124,8 @@ async function refreshStatus() {
 const viewCopy = {
   overview: [
     "THE SHARED KITCHEN",
-    "A sink check, at a glance.",
-    "What’s happening now, and what happened earlier.",
+    "S.I.N.K",
+    "State Inspection and Neatness Kritik",
   ],
   clips: [
     "THE REPLAY",
@@ -1149,6 +1149,7 @@ function navigate() {
   if (roiEditing) endRoiEdit();
   if (!["overview", "setup"].includes(currentView)) setLive(false);
   const copy = viewCopy[currentView];
+  $("page-sub").classList.toggle("sink-subtitle", currentView === "overview");
   ["page-eyebrow", "page-title", "page-sub"].forEach((id, i) =>
     setText(id, copy[i], { animate: false }),
   );
