@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 from collections import deque
 from enum import Enum
 
@@ -21,6 +22,7 @@ import requests
 
 import capture
 import motion
+from edge_runtime import SingleJob, temperature_c, preview_fps, small_frame
 
 # -- load .env --
 def _load_dotenv():
@@ -78,7 +80,7 @@ CAPTURE_DELAY    = float(_env("CAPTURE_DELAY_SEC", "10"))
 
 # heartbeat
 HEARTBEAT_SEC    = float(_env("HEARTBEAT_INTERVAL_SEC", "30"))
-HEALTH_INTERVAL_SEC = float(_env("HEALTH_INTERVAL_SEC", "30"))
+HEALTH_INTERVAL_SEC = min(10.0, max(2.0, float(_env("HEALTH_INTERVAL_SEC", "10"))))
 MONITOR_DURATION = float(_env("MONITORING_DURATION_SEC", "7200"))
 CLEAR_EXIT_N     = int(_env("CLEAR_EXIT_N", "3"))
 
@@ -99,7 +101,7 @@ class State(Enum):
 
 
 _shutdown = False
-_session = None
+_sessions = threading.local()
 _jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
 
 
@@ -123,7 +125,7 @@ class VideoBuffer:
 
     def maybe_add(self, frame, now):
         if now - self._last_save >= self._interval:
-            ok, jpeg = cv2.imencode(".jpg", frame, _jpeg_params)
+            ok, jpeg = cv2.imencode(".jpg", small_frame(frame), _jpeg_params)
             if ok:
                 self._buf.append(jpeg.tobytes())
                 self._last_save = now
@@ -145,7 +147,7 @@ class VideoBuffer:
                 "ffmpeg", "-y",
                 "-framerate", str(self._fps),
                 "-i", os.path.join(tmpdir, "%04d.jpg"),
-                "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1",
                 "-crf", "28", "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart", mp4_path,
             ]
@@ -178,15 +180,15 @@ class VideoBuffer:
 # -- networking --
 
 def _get_session():
-    global _session
-    if _session is None:
-        _session = requests.Session()
+    if not hasattr(_sessions, "http"):
+        _sessions.http = requests.Session()
         if API_KEY:
-            _session.headers["X-API-Key"] = API_KEY
-    return _session
+            _sessions.http.headers["X-API-Key"] = API_KEY
+    return _sessions.http
 
 
 def post_capture(frame, video_path=None):
+    video_handle = None
     try:
         ok, buf = cv2.imencode(".jpg", frame, _jpeg_params)
         if not ok:
@@ -194,7 +196,8 @@ def post_capture(frame, video_path=None):
 
         files = {"frame": ("frame.jpg", io.BytesIO(buf.tobytes()), "image/jpeg")}
         if video_path and os.path.isfile(video_path):
-            files["video"] = ("clip.mp4", open(video_path, "rb"), "video/mp4")
+            video_handle = open(video_path, "rb")
+            files["video"] = ("clip.mp4", video_handle, "video/mp4")
 
         resp = _get_session().post(
             SERVER_URL, headers={"X-Watcher-Mode": "motion_end"},
@@ -213,6 +216,9 @@ def post_capture(frame, video_path=None):
         log.error("http error: %s", e)
     except Exception as e:
         log.error("post failed: %s", e)
+    finally:
+        if video_handle is not None:
+            video_handle.close()
     return None
 
 
@@ -266,7 +272,7 @@ def post_live_frame(frame, quality=55):
     fidelity. Returns whether the server still wants frames.
     """
     try:
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        ok, buf = cv2.imencode(".jpg", small_frame(frame), [cv2.IMWRITE_JPEG_QUALITY, quality])
         if not ok:
             return False
         r = _get_session().post(
@@ -290,6 +296,8 @@ def post_health(camera, trigger):
     """
     try:
         payload = dict(camera.stats())
+        payload["temperature_c"] = temperature_c()
+        payload["preview_fps_limit"] = preview_fps(2, payload["temperature_c"])
         payload.update(trigger.stats())
         payload["motion_state"] = trigger.state
         r = _get_session().post(REPORT_URL, json=payload, timeout=10)
@@ -301,6 +309,8 @@ def post_health(camera, trigger):
 
 
 def main():
+    # Avoid OpenCV starting multiple CPU threads alongside the encoder.
+    cv2.setNumThreads(1)
     log.info("=== dishwatcher edge v2 ===")
     log.info("server:  %s", SERVER_URL)
     log.info("camera:  index %d, requesting %dx%d %s",
@@ -330,19 +340,33 @@ def main():
     srv_state = "CLEAR"
     consec_clear = 0
     monitoring_until = 0.0
+    capture_job = SingleJob("clip-upload")
+    live_job = SingleJob("live-preview")
+    health_job = SingleJob("camera-health")
+    job_kind = None
+    temp = temperature_c()
+    last_temp_check = 0.0
+
+    def send_visit(frame, saved_buffer):
+        path, _ = saved_buffer.encode_video()
+        return post_capture(frame, path)
 
     log.info("running")
 
     try:
         while not _shutdown:
+            now = time.monotonic()
+            health_done, reply = health_job.take()
+            if health_done and reply and reply.get("live_wanted"):
+                live_until = now + float(reply.get("lease_remaining", 0) or 0)
+                live_fps = float(reply.get("live_fps", 2) or 2)
+            if now - last_health >= HEALTH_INTERVAL_SEC and not health_job.busy:
+                health_job.submit(post_health, cam, trigger)
+                last_health = now
             ok, frame = cam.read()
             if not ok:
                 # the watchdog inside Camera handles reopening; we just pace
                 # ourselves and keep reporting so the wedge is visible.
-                now = time.monotonic()
-                if now - last_health >= HEALTH_INTERVAL_SEC:
-                    post_health(cam, trigger)
-                    last_health = now
                 time.sleep(0.2)
                 continue
 
@@ -352,28 +376,40 @@ def main():
             last_frame = frame
             frame_counter += 1
             now = time.monotonic()
+            if now - last_temp_check >= 5:
+                temp = temperature_c()
+                last_temp_check = now
+            done, resp = capture_job.take()
+            if done and resp:
+                srv_state = resp.get("state", srv_state)
+                if job_kind == "visit":
+                    monitoring_until = now + MONITOR_DURATION
+                    consec_clear = 0
+                    if resp.get("calibrated") is False:
+                        log.warning("server is NOT CALIBRATED: %s", resp.get("reason"))
+                elif resp.get("dishes_found"):
+                    consec_clear = 0
+                else:
+                    consec_clear += 1
+                    if consec_clear >= CLEAR_EXIT_N:
+                        monitoring_until = 0.0
+                log.info("%s [%s] ssim=%s", job_kind, srv_state, resp.get("ssim_score"))
+            live_done, keep_live = live_job.take()
+            if live_done and not keep_live:
+                live_until = 0.0
 
             # always buffer while something is happening, so the clip covers
             # the approach rather than starting when we notice
             if trigger.state == motion.MOTION or exited_at is not None:
                 video_buf.maybe_add(frame, now)
 
-            if now - last_health >= HEALTH_INTERVAL_SEC:
-                reply = post_health(cam, trigger)
-                last_health = now
-                if reply.get("live_wanted"):
-                    live_until = now + float(reply.get("lease_remaining", 0) or 0)
-                    live_fps = float(reply.get("live_fps", 4) or 4)
-                    log.info("live view requested, streaming at %.0f fps for %.0fs",
-                             live_fps, live_until - now)
-
             # live view: push frames while the lease holds. The server replies
             # with keep_streaming so a closed tab stops this promptly rather
             # than waiting out the whole lease.
-            if now < live_until and (now - last_live_push) >= (1.0 / max(1.0, live_fps)):
+            effective_fps = preview_fps(live_fps, temp)
+            if now < live_until and effective_fps > 0 and not live_job.busy and (now - last_live_push) >= (1.0 / effective_fps):
                 last_live_push = now
-                if not post_live_frame(frame):
-                    live_until = 0.0
+                live_job.submit(post_live_frame, frame.copy())
 
             if frame_counter % PROCESS_EVERY_N == 0:
                 event = trigger.update(frame)
@@ -387,49 +423,32 @@ def main():
                     # wait for the person to clear the frame before the shot
                     exited_at = now
 
-            # capture once the post-exit delay has elapsed
+            # Encoding and upload must not stop camera reads or motion detection.
             if exited_at is not None and (now - exited_at) >= CAPTURE_DELAY:
-                exited_at = None
                 if trigger.in_cooldown():
+                    exited_at = None
                     log.info("skipping capture, still in cooldown")
-                else:
+                elif not capture_job.busy:
+                    exited_at = None
                     trigger.mark_capture()
-                    video_path, _ = video_buf.encode_video()
-                    resp = post_capture(frame, video_path)
-                    video_buf.clear()
-                    if resp:
-                        if resp.get("calibrated") is False:
-                            # the server is telling us it cannot see. say so
-                            # here too rather than looping quietly.
-                            log.warning("server is NOT CALIBRATED: %s", resp.get("reason"))
-                        srv_state = resp.get("state", srv_state)
-                        monitoring_until = now + MONITOR_DURATION
-                        consec_clear = 0
-                        log.info("[%s] dishes=%s ssim=%s labels=%s",
-                                 srv_state, resp.get("dishes_found"),
-                                 resp.get("ssim_score"), resp.get("labels"))
+                    saved_buffer, video_buf = video_buf, VideoBuffer(BUFFER_SIZE, VIDEO_FPS)
+                    job_kind = "visit"
+                    capture_job.submit(send_visit, frame.copy(), saved_buffer)
+                # A previous job is still finishing: keep one pending visit in
+                # the bounded ring, rather than dropping it or growing a queue.
 
-            # heartbeat while the server still cares
-            if now < monitoring_until and (now - last_heartbeat) >= HEARTBEAT_SEC:
+            if now < monitoring_until and (now - last_heartbeat) >= HEARTBEAT_SEC and not capture_job.busy and exited_at is None:
                 last_heartbeat = now
-                resp = post_heartbeat(frame)
-                if resp:
-                    srv_state = resp.get("state", srv_state)
-                    if resp.get("dishes_found"):
-                        consec_clear = 0
-                    else:
-                        consec_clear += 1
-                        if consec_clear >= CLEAR_EXIT_N:
-                            monitoring_until = 0.0
-                            log.info("clear x%d, back to idle", consec_clear)
-                    log.info("hb [%s] %s", srv_state,
-                             "dishes" if resp.get("dishes_found") else
-                             f"clear ({consec_clear}/{CLEAR_EXIT_N})")
+                job_kind = "heartbeat"
+                capture_job.submit(post_heartbeat, frame.copy())
 
             if trigger.state == motion.IDLE and exited_at is None:
                 time.sleep(IDLE_SLEEP_MS / 1000)
 
     finally:
+        capture_job.close()
+        live_job.close()
+        health_job.close()
         s = trigger.stats()
         log.info("shutting down. motion entered=%d exited=%d flap_ratio=%s | "
                  "camera reopens=%d usb_resets=%d",

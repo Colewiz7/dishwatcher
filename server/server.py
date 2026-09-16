@@ -124,6 +124,8 @@ async def _retention_loop():
 # paint immediately on load instead of a cold spinner.
 from collections import deque  # noqa: E402
 LAST_DETECTION = {}
+LAST_RAW_FRAME = None
+UPLOAD_LOCK = asyncio.Lock()
 EVENTS = deque(maxlen=60)
 
 # Live view.
@@ -137,7 +139,8 @@ EVENTS = deque(maxlen=60)
 # The deadline auto-expires so a closed browser tab cannot leave the Pi
 # streaming forever and burning its USB bus and battery of CPU.
 LIVE = {"wanted_until": 0.0, "frame": None, "frame_at": 0.0, "seq": 0}
-LIVE_LEASE_SEC = float(os.environ.get("LIVE_LEASE_SEC", "120"))
+LIVE_LEASE_SEC = float(os.environ.get("LIVE_LEASE_SEC", "45"))
+LIVE_FPS = min(4.0, max(0.5, float(os.environ.get("LIVE_FPS", "2"))))
 
 
 def record_event(kind, message):
@@ -245,41 +248,7 @@ def _forward_auth_ok(request: Request) -> bool:
 
 _AUTH_EXEMPT_EXACT = {"/healthz", "/readyz", "/metrics"}
 
-# Paths that must never be served to a request that arrived from the internet,
-# regardless of how well authenticated it is. Roommate photos are pictures of
-# people who did not sign up to be on a public host, and "it is behind SSO" is
-# not the same promise as "it never leaves the flat". These are reachable only
-# over the tailnet or from inside the cluster network.
-LOCAL_ONLY_PATTERNS = ("/people/", "/thumbs/", "/videos/")
-PUBLIC_HOSTNAMES = {
-    h.strip().lower()
-    for h in os.environ.get("PUBLIC_HOSTNAMES", "sink.colewiz.dev").split(",")
-    if h.strip()
-}
-
-
-def _is_local_only_path(path: str) -> bool:
-    # /people (the roster: names and counts) is fine; a photo is not
-    if path.startswith("/people/") and path.endswith("/photo"):
-        return True
-    return path.startswith(("/thumbs/", "/videos/"))
-
-
-def _came_from_the_internet(request: Request) -> bool:
-    """
-    True when the request arrived through the Cloudflare tunnel.
-
-    Two independent signals, because either alone can be spoofed by something
-    already inside the cluster: the Authentik outpost stamps its own headers on
-    anything it proxies, and the public Host header only appears on requests
-    that resolved the public name.
-    """
-    if request.headers.get(FORWARD_AUTH_HEADER, ""):
-        return True
-    host = (request.headers.get("host") or "").split(":")[0].lower()
-    if host in PUBLIC_HOSTNAMES:
-        return True
-    return bool(request.headers.get("cf-ray") or request.headers.get("cf-connecting-ip"))
+# Media uses the same authentication as the dashboard, on every network.
 _AUTH_EXEMPT_PREFIX = ("/upload", "/camera/", "/live/frame")
 
 
@@ -302,13 +271,6 @@ async def dashboard_auth(request: Request, call_next):
     path = request.url.path
     if path in _AUTH_EXEMPT_EXACT or path.startswith(_AUTH_EXEMPT_PREFIX):
         return await call_next(request)
-
-    if _is_local_only_path(path) and _came_from_the_internet(request):
-        log.info("refused %s from the public route", path)
-        return JSONResponse(
-            {"error": "not available over the internet",
-             "detail": "photos and clips are served only on the local network"},
-            status_code=403)
 
     if _forward_auth_ok(request):
         return await call_next(request)
@@ -502,6 +464,23 @@ async def live_mjpeg(request: Request):
                  "X-Accel-Buffering": "no"})
 
 
+@app.get("/live.jpg")
+async def live_snapshot():
+    """A complete JPEG response works even through proxies that buffer MJPEG.
+
+    Reading keeps the camera lease alive. Old frames are never labelled live;
+    the browser can retain its last image while reconnecting.
+    """
+    LIVE["wanted_until"] = time.time() + LIVE_LEASE_SEC
+    headers = {"Cache-Control": "private, no-store", "Vary": "Authorization, Cookie"}
+    age = time.time() - LIVE["frame_at"] if LIVE["frame_at"] else None
+    if LIVE["frame"] is None or age is None or age > 10:
+        return JSONResponse({"detail": "Waiting for a fresh camera frame", "frame_age": age},
+                            status_code=503, headers={**headers, "Retry-After": "2"})
+    return Response(LIVE["frame"], media_type="image/jpeg", headers={
+        **headers, "X-Frame-At": str(LIVE["frame_at"]), "X-Frame-Seq": str(LIVE["seq"])})
+
+
 @app.get("/clips")
 async def list_clips(limit: int = Query(40, ge=1, le=200)):
     """
@@ -518,7 +497,7 @@ async def list_clips(limit: int = Query(40, ge=1, le=200)):
         out.append({
             **v,
             "url": f"/videos/{name}",
-            "thumb_url": f"/thumbs/{v['thumb']}" if v.get("thumb") else None,
+            "thumb_url": v.get("thumb_url"),
             "tag": people.tag_of(name),
         })
     return JSONResponse({"clips": out, "counts": people.counts()})
@@ -606,12 +585,12 @@ async def get_video(filename: str):
     path = storage.get_video_path(Path(filename).name)
     if not path or not Path(path).is_file():
         raise HTTPException(404, "no such video")
-    return FileResponse(path, media_type="video/mp4")
+    return FileResponse(path, media_type="video/mp4", headers={"Cache-Control": "private, no-store"})
 
 
 @app.get("/")
 async def index():
-    return FileResponse(STATIC_DIR / "viewer.html")
+    return FileResponse(STATIC_DIR / "dashboard.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/calibration")
@@ -622,7 +601,9 @@ async def calibration_status():
 @app.post("/calibration/reference")
 async def calibration_set_reference():
     """Promote the most recent capture to the clean reference."""
-    frame = storage.latest_frame()
+    # Stored dashboard JPEGs have boxes/text burned in. Never make those
+    # annotations part of the clean baseline used for detection.
+    frame = LAST_RAW_FRAME
     if frame is None:
         raise HTTPException(409, "no capture available yet; wait for the camera to send one")
     state = calib.set_reference(frame)
@@ -660,11 +641,11 @@ async def camera_report(request: Request, x_api_key: Optional[str] = Header(defa
     _check_api_key(x_api_key)
     CAMERA["stats"] = await request.json()
     CAMERA["seen"] = True
-    CAMERA["last_report"] = datetime.now().isoformat()
+    CAMERA["last_report"] = datetime.now(timezone.utc).isoformat()
     remaining = max(0.0, LIVE["wanted_until"] - time.time())
     return JSONResponse({"ok": True, "live_wanted": remaining > 0,
                          "lease_remaining": round(remaining, 1),
-                         "live_fps": float(os.environ.get("LIVE_FPS", "4"))})
+                         "live_fps": LIVE_FPS})
 
 
 @app.get("/config/schema")
@@ -788,6 +769,11 @@ def _dashboard_payload():
             pass
 
     cam = dict(CAMERA.get("stats") or {})
+    if CAMERA.get("last_report"):
+        reported = datetime.fromisoformat(CAMERA["last_report"])
+        cam["report_age_seconds"] = max(0, (datetime.now(timezone.utc) - reported).total_seconds())
+        if cam.get("seconds_since_last_frame") is not None:
+            cam["seconds_since_last_frame"] += cam["report_age_seconds"]
     frame_name = last.get("image_file") if last else None
 
     # Fall back to the most recent stored frame when there is no detection yet.
@@ -824,7 +810,7 @@ def _dashboard_payload():
             "have_frame": LIVE["frame"] is not None,
             "frame_age": round(time.time() - LIVE["frame_at"], 1) if LIVE["frame_at"] else None,
         },
-        "media_local_only": True,
+        "media_local_only": False,
         "events": list(EVENTS),
         "consensus": st.get("consensus"),
     }
@@ -983,11 +969,18 @@ async def upload_frame(
 ):
     _check_api_key(x_api_key)
 
+    async with UPLOAD_LOCK:
+        return await _process_upload(frame, video, mode)
+
+
+async def _process_upload(frame, video, mode):
+    global LAST_RAW_FRAME
     raw = await frame.read()
     if not raw:
         raise HTTPException(400, "empty frame")
 
-    img = _decode_frame(raw)
+    img = await asyncio.to_thread(_decode_frame, raw)
+    LAST_RAW_FRAME = img.copy()
     capture_mode = mode or "unknown"
     log.info("frame %dx%d (%.1fKB) mode=%s", img.shape[1], img.shape[0], len(raw)/1024, capture_mode)
 
@@ -997,7 +990,7 @@ async def upload_frame(
     if video:
         video_bytes = await video.read()
         if video_bytes:
-            video_filename, video_thumb = storage.save_video(
+            video_filename, video_thumb = await asyncio.to_thread(storage.save_video,
                 video_bytes, video.filename or "clip.mp4",
                 first_frame=img,  # use current frame as thumbnail
                 rotation=_get_rotation(),
@@ -1008,7 +1001,7 @@ async def upload_frame(
     # exists to kill. We record it, tell the camera plainly, and stop; we do not
     # advance the state machine on a guess.
     try:
-        result = detector.detect(
+        result = await asyncio.to_thread(detector.detect,
             img,
             calib,
             ssim_threshold=config.get("ssim_threshold", 0.82),
@@ -1042,7 +1035,7 @@ async def upload_frame(
         mins = int(sm.grace_remaining.total_seconds() / 60)
         state_label += f" ({mins}m)"
 
-    annotated = detector.annotate_frame(img, result, roi=calib.roi, state_label=state_label)
+    annotated = await asyncio.to_thread(detector.annotate_frame, img, result, roi=calib.roi, state_label=state_label)
     quality = config.get("jpeg_quality", 90)
     img_filename = storage.save_frame(annotated, result["dishes_found"],
                                        state=sm.state.value, quality=quality)
@@ -1103,11 +1096,11 @@ async def upload_frame(
 
     if sm_result["should_alert"]:
         msg = f"dishes sitting in the sink for {int(sm.grace_minutes)} min"
-        notifier.send_alert(msg, image_path=storage.get_image_path(img_filename))
+        await asyncio.to_thread(notifier.send_alert, msg, image_path=storage.get_image_path(img_filename))
 
     if (sm_result["changed"] and sm_result["state"] == "CLEAR"
             and sm_result["previous_state"] in ("CONFIRMED", "ALERTED")):
-        notifier.send_clear_notification()
+        await asyncio.to_thread(notifier.send_clear_notification)
 
     log.info("ssim=%.3f | %s | state=%s | labels=%s",
              result["ssim_score"], "DIRTY" if result["dishes_found"] else "CLEAN",
@@ -1130,15 +1123,9 @@ async def upload_frame(
 
 # -- viewer --
 
-@app.get("/", response_class=HTMLResponse)
-async def root_page():
-    html = STATIC_DIR / "viewer.html"
-    if not html.exists(): raise HTTPException(500, "viewer.html not found")
-    return FileResponse(str(html), media_type="text/html")
-
 @app.get("/view", response_class=HTMLResponse)
 async def view_page():
-    return await root_page()
+    return await index()
 
 @app.get("/view/list")
 async def list_images(limit: int = 40):
