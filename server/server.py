@@ -775,6 +775,9 @@ def _dashboard_payload():
         if cam.get("seconds_since_last_frame") is not None:
             cam["seconds_since_last_frame"] += cam["report_age_seconds"]
     frame_name = last.get("image_file") if last else None
+    frame_age = (
+        max(0.0, (datetime.utcnow() - datetime.fromisoformat(last["at"])).total_seconds())
+        if last and last.get("at") else None)
 
     # Fall back to the most recent stored frame when there is no detection yet.
     # Without this a fresh install has nothing to show: uploads are rejected
@@ -786,6 +789,7 @@ def _dashboard_payload():
             p = storage.get_latest_image_path()
             if p:
                 frame_name = Path(p).name
+                frame_age = max(0.0, time.time() - Path(p).stat().st_mtime)
         except Exception:
             pass
 
@@ -802,9 +806,7 @@ def _dashboard_payload():
         "camera": cam,
         "camera_seen": CAMERA["seen"],
         "latest_frame_url": f"/images/{frame_name}" if frame_name else None,
-        "latest_frame_age_seconds": (
-            max(0.0, (datetime.utcnow() - datetime.fromisoformat(last["at"])).total_seconds())
-            if last and last.get("at") else None),
+        "latest_frame_age_seconds": frame_age,
         "live": {
             "wanted": max(0.0, LIVE["wanted_until"] - time.time()) > 0,
             "have_frame": LIVE["frame"] is not None,

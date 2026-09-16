@@ -247,7 +247,6 @@ h2 {
   border-radius: var(--radius-inner);
   background: var(--surface-container-lowest);
   overflow: hidden;
-  min-height: 180px;
 }
 .frame {
   width: 100%;

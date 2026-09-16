@@ -111,6 +111,19 @@ def test_camera_report_ages_between_reports(srv, monkeypatch):
     assert cam["seconds_since_last_frame"] >= 121
 
 
+def test_stored_snapshot_keeps_its_age_after_restart(srv, monkeypatch, tmp_path):
+    import os
+    frame = tmp_path / "old.jpg"
+    frame.write_bytes(b"jpeg")
+    captured = time.time() - 3600
+    os.utime(frame, (captured, captured))
+    monkeypatch.setattr(srv, "LAST_DETECTION", {})
+    monkeypatch.setattr(srv.storage, "get_latest_image_path", lambda: str(frame))
+    status = request(srv, "/status", headers=BASIC).json()
+    assert status["latest_frame_url"] == "/images/old.jpg"
+    assert 3600 <= status["latest_frame_age_seconds"] < 3605
+
+
 def test_reference_never_uses_an_annotated_dashboard_frame(srv, monkeypatch, tmp_path):
     import numpy as np
     from calibration import Calibration

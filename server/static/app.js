@@ -317,7 +317,9 @@ function renderHeat(tiles, threshold) {
 
 function renderEvents(events) {
   const el = $("events");
+  events = events.filter((e) => !e.message?.startsWith("retention removed"));
   if (!events.length) {
+    delete el.dataset.sig;
     if (el.dataset.state !== "empty") {
       el.innerHTML = '<div class="empty">No events yet</div>';
       el.dataset.state = "empty";
@@ -330,9 +332,7 @@ function renderEvents(events) {
   el.dataset.state = "list";
 
   el.innerHTML = "";
-  for (const e of events
-    .filter((e) => !e.message?.startsWith("retention removed"))
-    .slice(0, 12)) {
+  for (const e of events.slice(0, 12)) {
     const row = document.createElement("div");
     row.className = "event";
 
@@ -608,7 +608,12 @@ function endRoiEdit() {
   cv.addEventListener("touchmove", move, { passive: false });
   window.addEventListener("touchend", up);
   window.addEventListener("resize", () => {
-    if (roiEditing) drawRoi();
+    // A draft uses rendered pixels; do not save stale coordinates after rotation.
+    if (roiEditing) {
+      roiStart = null;
+      roiBox = null;
+      drawRoi();
+    }
   });
 })();
 
