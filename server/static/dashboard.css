@@ -120,8 +120,8 @@ button:disabled {
   letter-spacing: -0.04em;
 }
 .brand-mark {
-  width: 48px;
-  height: 48px;
+  width: 72px;
+  height: 72px;
   display: block;
   flex: 0 0 auto;
   object-fit: contain;
@@ -998,8 +998,8 @@ footer {
     font-size: 1.1rem;
   }
   .brand-mark {
-    width: 40px;
-    height: 40px;
+    width: 56px;
+    height: 56px;
   }
   .topbar-actions {
     gap: 5px;

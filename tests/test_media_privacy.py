@@ -87,21 +87,36 @@ def test_dashboard_uses_generated_sink_favicon(srv):
         def handle_starttag(self, tag, attrs):
             attrs = dict(attrs)
             if tag == "img" and attrs.get("class") == "brand-mark":
-                assert attrs["src"] == "/static/sink-touch-icon-v2.png"
+                assert attrs["src"] == "/static/sink-header-v3.png"
                 assert attrs["alt"] == ""  # Home link already has an accessible name.
-                assert attrs["width"] == attrs["height"] == "48"
+                assert attrs["width"] == attrs["height"] == "72"
                 self.found = True
     parser = BrandParser()
     parser.feed(html)
     assert parser.found
-    for name in ("sink-favicon-v2.ico", "sink-favicon-v2.png", "sink-touch-icon-v2.png"):
+    for name in ("sink-eye-v3.ico", "sink-eye-v3.png", "sink-touch-icon-v2.png", "sink-header-v3.png"):
         assert f'/static/{name}' in html
         result = request(srv, f"/static/{name}", headers=BASIC)
         assert result.status_code == 200
         assert result.headers["content-type"].startswith("image/")
         assert 100 < len(result.content) < 50000
-    icon = request(srv, "/static/sink-favicon-v2.ico", headers=BASIC).content
+    icon = request(srv, "/static/sink-eye-v3.ico", headers=BASIC).content
     assert icon[:6] == b"\x00\x00\x01\x00\x04\x00"  # four icon resolutions
+
+
+def test_eye_and_header_assets_have_transparent_backgrounds(srv):
+    import cv2
+    import numpy as np
+    for name in ("sink-eye-v3.png", "sink-header-v3.png"):
+        raw = request(srv, f"/static/{name}", headers=BASIC).content
+        image = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED)
+        assert image.shape[2] == 4
+        assert image[0, 0, 3] == 0 and image[-1, -1, 3] == 0
+        if name == "sink-eye-v3.png":
+            columns = np.where(image[:, :, 3].max(axis=0) > 128)[0]
+            # Tapered tips become antialiased at 32px; solid artwork still
+            # fills at least 7/8 of the tab canvas, unlike the full sink icon.
+            assert columns[-1] - columns[0] + 1 >= 28
 
 
 def test_clip_filters_apply_before_pagination(srv, monkeypatch):
