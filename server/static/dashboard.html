@@ -9,7 +9,7 @@
     <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#1a120e" />
     <title>Dishwatcher · Kitchen</title>
-    <link rel="stylesheet" href="/static/dashboard.css?v=5" />
+    <link rel="stylesheet" href="/static/dashboard.css?v=6" />
   </head>
   <body>
     <a class="skip" href="#main">Skip to content</a>
@@ -173,7 +173,8 @@
               Recent clips <span class="count" id="clip-count"></span>
             </h2>
             <p class="helper">
-              Recorded after a visit to the sink. Watch, then tag a roommate.
+              Browse by day or roommate. Nearby visits are grouped into cooking
+              sessions.
             </p>
           </div>
           <a class="text-link" href="#clips" id="all-clips">View all clips ↗</a>
@@ -189,6 +190,17 @@
             </button>
           </div>
           <button class="iconbtn" id="refresh-clips">↻ Refresh</button>
+        </div>
+        <div class="clip-search">
+          <label>Day <input type="date" id="clip-day" /></label>
+          <label
+            >Roommate
+            <select id="clip-person-filter">
+              <option value="">Everyone</option>
+            </select></label
+          >
+          <button class="button" id="clear-clip-filters">Clear filters</button>
+          <span class="helper" id="clip-results" role="status"></span>
         </div>
         <p id="clips-error" class="error-note" role="status" hidden></p>
         <div class="clips" id="clips">
@@ -344,6 +356,28 @@
         </button>
       </div>
       <video id="clip-player" controls playsinline preload="metadata"></video>
+      <div class="review-controls">
+        <button class="button" id="previous-clip">← Previous</button>
+        <span id="clip-position" aria-live="polite"></span>
+        <button class="button" id="next-clip">Next →</button>
+        <label
+          >Speed
+          <select id="clip-speed">
+            <option value="0.5">0.5×</option>
+            <option value="1" selected>1×</option>
+            <option value="1.5">1.5×</option>
+            <option value="2">2×</option>
+            <option value="4">4×</option>
+          </select></label
+        >
+        <label
+          ><input type="checkbox" id="clip-autonext" /> Play next
+          automatically</label
+        >
+      </div>
+      <p class="helper">
+        N / P: next / previous clip · J / L: back / forward 10 seconds
+      </p>
       <p class="error-note" id="player-error" role="status" hidden>
         Couldn’t play this clip. Try again or open the original file.
       </p>
@@ -356,6 +390,6 @@
       </div>
     </dialog>
     <div id="toast" role="status" hidden></div>
-    <script src="/static/app.js?v=5"></script>
+    <script src="/static/app.js?v=6"></script>
   </body>
 </html>

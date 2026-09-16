@@ -8,20 +8,23 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
+import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Header, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse
 
 import calibration as calibration_mod
+import clip_processing
 import config
 import detector
 import metrics
@@ -103,7 +106,7 @@ async def _retention_loop():
             removed = await asyncio.to_thread(
                 storage.enforce_retention,
                 config.get("clip_retention_days", 14),
-                config.get("image_retention_days", 30),
+                config.get("image_retention_days", 14),
             )
             metrics.inc("dishwatcher_clips_deleted_total", removed.get("clips", 0))
             for gone in removed.get("removed_clips", []):
@@ -191,7 +194,7 @@ async def _start_background():
     log.info("retention sweep every %.0fs (clips %sd, frames %sd)",
              RETENTION_INTERVAL_SEC,
              config.get("clip_retention_days", 14),
-             config.get("image_retention_days", 30))
+             config.get("image_retention_days", 14))
 
 
 # -- dashboard auth --
@@ -292,7 +295,9 @@ async def dashboard_auth(request: Request, call_next):
 
 
 def _check_api_key(key):
-    if API_KEY and key != API_KEY:
+    if not API_KEY:
+        raise HTTPException(503, "camera API key is not configured")
+    if not secrets.compare_digest(key or "", API_KEY):
         raise HTTPException(401, "bad api key")
 
 
@@ -509,25 +514,81 @@ async def live_snapshot(after: Optional[str] = Query(default=None, max_length=10
 
 
 @app.get("/clips")
-async def list_clips(limit: int = Query(40, ge=1, le=200)):
+async def list_clips(limit: int = Query(40, ge=1, le=200), offset: int = Query(0, ge=0),
+                     day: Optional[date] = None, person: Optional[str] = Query(None, max_length=64),
+                     tagged: Optional[bool] = None):
     """
     Saved blame clips, newest first, with whoever they are attributed to.
 
     The clips were being recorded from the start and there was no way to watch
     one, so they were evidence nobody could read.
     """
+    return JSONResponse(await asyncio.to_thread(_clip_listing, limit, offset, day, person, tagged))
+
+
+def _clip_listing(limit, offset, day, person, tagged):
     out = []
-    for v in storage.list_videos(limit=limit):
+    for v in storage.list_videos(limit=None):
         name = v.get("filename") or v.get("name")
         if not name:
+            continue
+        tag = people.tag_of(name)
+        if day and not name.startswith(day.strftime("%Y%m%d")):
+            continue
+        if person and (not tag or tag.get("person_id") != person):
+            continue
+        if tagged is not None and bool(tag) != tagged:
             continue
         out.append({
             **v,
             "url": f"/videos/{name}",
             "thumb_url": v.get("thumb_url"),
-            "tag": people.tag_of(name),
+            "tag": tag,
         })
-    return JSONResponse({"clips": out, "counts": people.counts()})
+    return {"clips": out[offset:offset + limit], "counts": people.counts(),
+            "total": len(out), "offset": offset, "has_more": offset + limit < len(out)}
+
+
+def _clip_metadata(value):
+    if not value:
+        return {}
+    try:
+        data = json.loads(value)
+        session = data.get("session_id", "")
+        part = int(data.get("part", 1))
+        if not isinstance(session, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", session) or not 1 <= part <= 10000:
+            raise ValueError()
+        at = datetime.fromisoformat(data["recorded_at"].replace("Z", "+00:00"))
+        if at.tzinfo is None:
+            raise ValueError()
+        return {"session_id": session, "part": part, "recorded_at": at.isoformat()}
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise HTTPException(422, "invalid clip metadata")
+
+
+async def _save_clip_upload(video, metadata=None, first_frame=None):
+    raw = await video.read(32 * 1024 * 1024 + 1)
+    if len(raw) > 32 * 1024 * 1024:
+        raise HTTPException(413, "clip exceeds 32 MiB")
+    if not raw:
+        raise HTTPException(400, "empty clip")
+    info = _clip_metadata(metadata)
+    try:
+        converted, duration = await asyncio.to_thread(clip_processing.normalize_video, raw, _get_rotation())
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        raise HTTPException(422, "could not process clip") from exc
+    info["duration_seconds"] = duration
+    return await asyncio.to_thread(storage.save_video, converted, "clip.mp4",
+                                   first_frame=first_frame, rotation=None, metadata=info)
+
+
+@app.post("/camera/clip")
+async def upload_clip(video: UploadFile = File(...), clip_metadata: Optional[str] = Form(None, max_length=1024),
+                      x_api_key: Optional[str] = Header(default=None)):
+    _check_api_key(x_api_key)
+    async with UPLOAD_LOCK:
+        filename, thumb = await _save_clip_upload(video, clip_metadata)
+    return {"ok": True, "video_file": filename, "thumb_file": thumb}
 
 
 @app.get("/thumbs/{filename}")
@@ -995,14 +1056,15 @@ async def upload_frame(
     video: Optional[UploadFile] = File(None),
     x_api_key: Optional[str] = Header(default=None),
     mode: Optional[str] = Header(default=None, alias="X-Watcher-Mode"),
+    clip_metadata: Optional[str] = Form(None, max_length=1024),
 ):
     _check_api_key(x_api_key)
 
     async with UPLOAD_LOCK:
-        return await _process_upload(frame, video, mode)
+        return await _process_upload(frame, video, mode, clip_metadata)
 
 
-async def _process_upload(frame, video, mode):
+async def _process_upload(frame, video, mode, clip_metadata=None):
     global LAST_RAW_FRAME
     raw = await frame.read()
     if not raw:
@@ -1017,13 +1079,7 @@ async def _process_upload(frame, video, mode):
     video_filename = None
     video_thumb = None
     if video:
-        video_bytes = await video.read()
-        if video_bytes:
-            video_filename, video_thumb = await asyncio.to_thread(storage.save_video,
-                video_bytes, video.filename or "clip.mp4",
-                first_frame=img,  # use current frame as thumbnail
-                rotation=_get_rotation(),
-            )
+        video_filename, video_thumb = await _save_clip_upload(video, clip_metadata, img)
 
     # Run detection. The uncalibrated case now RAISES rather than returning a
     # default score that reads as clean, which is the v1 bug this whole rewrite

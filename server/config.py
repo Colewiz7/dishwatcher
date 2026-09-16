@@ -50,7 +50,7 @@ SCHEMA = {
     # retention. These are blame clips: video of people in a home. v1 kept
     # everything forever and its own TODO admitted it.
     "clip_retention_days":  {"default": 14, "type": "int", "min": 1, "max": 365, "step": 1, "group": "retention", "label": "keep clips (days)", "desc": "blame clips older than this are deleted"},
-    "image_retention_days": {"default": 30, "type": "int", "min": 1, "max": 365, "step": 1, "group": "retention", "label": "keep frames (days)"},
+    "image_retention_days": {"default": 14, "type": "int", "min": 1, "max": 365, "step": 1, "group": "retention", "label": "keep frames (days)"},
 
     # admin
     "admin_password":       {"default": "",     "type": "password", "group": "admin", "label": "dashboard password", "desc": "leave empty to disable"},

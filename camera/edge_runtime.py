@@ -2,11 +2,31 @@
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
+import uuid
 from pathlib import Path
 
 import cv2
 
 log = logging.getLogger("dishwatcher.edge")
+
+
+class ClipSession:
+    """Nearby visits belong to one cooking session, with ordered clip parts."""
+    def __init__(self, gap_seconds=180):
+        self.gap_seconds = gap_seconds
+        self.session_id = None
+        self.last_activity = None
+        self.part = 0
+
+    def touch(self, now):
+        if self.last_activity is None or now - self.last_activity > self.gap_seconds:
+            self.session_id = uuid.uuid4().hex
+            self.part = 0
+        self.last_activity = now
+
+    def metadata(self, recorded_at):
+        self.part += 1
+        return {"session_id": self.session_id, "part": self.part, "recorded_at": recorded_at}
 
 
 class SingleJob:

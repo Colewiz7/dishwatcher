@@ -79,6 +79,44 @@ def test_clip_list_keeps_storage_thumbnail_url(srv, monkeypatch):
     assert clip["url"] == "/videos/clip.mp4"
 
 
+def test_clip_filters_apply_before_pagination(srv, monkeypatch):
+    monkeypatch.setattr(srv.storage, "list_videos", lambda limit: [
+        {"filename": "20260916_120000_blame.mp4"},
+        {"filename": "20260916_110000_blame.mp4"},
+        {"filename": "20260915_120000_blame.mp4"}])
+    monkeypatch.setattr(srv.people, "tag_of", lambda name: {"person_id": "a", "name": "A"} if "110000" in name else None)
+    result = request(srv, "/clips?day=2026-09-16&tagged=false&limit=1", headers=BASIC).json()
+    assert result["total"] == 1 and not result["has_more"]
+    assert result["clips"][0]["filename"] == "20260916_120000_blame.mp4"
+    result = request(srv, "/clips?person=a", headers=BASIC).json()
+    assert result["total"] == 1 and "110000" in result["clips"][0]["filename"]
+    result = request(srv, "/clips?limit=1&offset=1", headers=BASIC).json()
+    assert result["total"] == 3 and result["has_more"]
+    assert "110000" in result["clips"][0]["filename"]
+
+
+def test_chunk_upload_is_authenticated_and_does_not_change_detection(srv, monkeypatch):
+    import json
+    monkeypatch.setattr(srv, "API_KEY", "camera-key")
+    monkeypatch.setattr(srv.clip_processing, "normalize_video", lambda raw, rotation: (b"browser mp4", 59.8))
+    saved = {}
+    def save(raw, filename, **kwargs):
+        saved.update(kwargs)
+        return "new.mp4", "new.jpg"
+    monkeypatch.setattr(srv.storage, "save_video", save)
+    original = dict(srv.LAST_DETECTION)
+    files = {"video": ("clip.avi", b"jpeg stream", "video/x-msvideo")}
+    assert request(srv, "/camera/clip", method="POST", files=files).status_code == 401
+    response = request(srv, "/camera/clip", method="POST", files=files, headers={"X-API-Key": "camera-key"},
+                       data={"clip_metadata": json.dumps({"session_id": "test-session", "part": 2, "recorded_at": "2026-09-16T10:00:00+00:00"})})
+    assert response.status_code == 200
+    assert saved["metadata"]["duration_seconds"] == 59.8
+    assert saved["metadata"]["part"] == 2 and saved["rotation"] is None
+    assert srv.LAST_DETECTION == original
+    monkeypatch.setattr(srv, "API_KEY", None)
+    assert request(srv, "/camera/clip", method="POST", files=files).status_code == 503
+
+
 def test_live_snapshot_lease_freshness_and_auth(srv, monkeypatch):
     live = {"wanted_until": 0, "frame": None, "frame_at": 0, "seq": 0}
     monkeypatch.setattr(srv, "LIVE", live)

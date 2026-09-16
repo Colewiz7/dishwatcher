@@ -4,6 +4,7 @@
 # now flips frames at capture time so video clips are right-side-up too.
 
 import io
+import json
 import logging
 import os
 import shutil
@@ -14,6 +15,7 @@ import tempfile
 import time
 import threading
 from collections import deque
+from datetime import datetime, timezone
 from enum import Enum
 
 import cv2
@@ -22,7 +24,7 @@ import requests
 
 import capture
 import motion
-from edge_runtime import SingleJob, temperature_c, preview_fps, small_frame
+from edge_runtime import ClipSession, SingleJob, temperature_c, preview_fps, small_frame
 
 # -- load .env --
 def _load_dotenv():
@@ -74,7 +76,7 @@ IDLE_SLEEP_MS    = float(_env("IDLE_SLEEP_MS", "50"))
 
 # video
 VIDEO_FPS        = int(_env("VIDEO_FPS", "5"))
-VIDEO_DURATION   = int(_env("VIDEO_DURATION", "15"))
+VIDEO_DURATION   = min(120, max(15, int(_env("CLIP_CHUNK_SEC", "60"))))
 BUFFER_SIZE      = VIDEO_FPS * VIDEO_DURATION
 CAPTURE_DELAY    = float(_env("CAPTURE_DELAY_SEC", "10"))
 
@@ -122,21 +124,41 @@ class VideoBuffer:
         self._fps = fps
         self._last_save = 0.0
         self._interval = 1.0 / fps
+        self._times = deque(maxlen=maxlen)
+        self._next_save = None
 
     def maybe_add(self, frame, now):
-        if now - self._last_save >= self._interval:
+        if self._next_save is None or now >= self._next_save:
             ok, jpeg = cv2.imencode(".jpg", small_frame(frame), _jpeg_params)
             if ok:
                 self._buf.append(jpeg.tobytes())
+                self._times.append(now)
                 self._last_save = now
+                # Keep phase instead of rounding every interval up to the next
+                # camera read (which made a 5 fps target record only ~3 fps).
+                if self._next_save is None:
+                    self._next_save = now + self._interval
+                else:
+                    skipped = max(1, int((now - self._next_save) / self._interval) + 1)
+                    self._next_save += skipped * self._interval
+
+    def recorded_at(self):
+        age = time.monotonic() - self._times[0] if self._times else 0
+        return datetime.fromtimestamp(time.time() - age, timezone.utc).isoformat()
+
+    @property
+    def duration_seconds(self):
+        if len(self._times) > 1:
+            return self._times[-1] - self._times[0] + self._interval
+        return len(self._buf) / self._fps
 
     def encode_video(self):
-        """h264 mp4 via ffmpeg for browser playback"""
+        """Package JPEGs without re-encoding; the server creates browser H.264."""
         if len(self._buf) < 5:
             return None, False
 
         tmpdir = tempfile.mkdtemp(prefix="blame_")
-        fd, mp4_path = tempfile.mkstemp(prefix="dishwatcher-clip-", suffix=".mp4")
+        fd, mp4_path = tempfile.mkstemp(prefix="dishwatcher-clip-", suffix=".avi")
         os.close(fd)
         encoded = False
 
@@ -147,17 +169,15 @@ class VideoBuffer:
 
             cmd = [
                 "ffmpeg", "-y",
-                "-framerate", str(self._fps),
+                "-framerate", str(round(len(self._buf) / max(0.01, self.duration_seconds), 4)),
                 "-i", os.path.join(tmpdir, "%04d.jpg"),
-                "-c:v", "libx264", "-preset", "ultrafast", "-threads", "1",
-                "-crf", "28", "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart", mp4_path,
+                "-c:v", "copy", "-threads", "1", "-f", "avi", mp4_path,
             ]
             r = subprocess.run(cmd, capture_output=True, timeout=60)
 
             if r.returncode == 0 and os.path.isfile(mp4_path) and os.path.getsize(mp4_path) > 0:
                 size_kb = os.path.getsize(mp4_path) / 1024
-                log.info("video: h264 mp4 (%.0f KB, %d frames)", size_kb, len(self._buf))
+                log.info("video: MJPEG chunk (%.0f KB, %d frames)", size_kb, len(self._buf))
                 encoded = True
                 return mp4_path, True
             else:
@@ -176,6 +196,8 @@ class VideoBuffer:
 
     def clear(self):
         self._buf.clear()
+        self._times.clear()
+        self._next_save = None
 
     @property
     def count(self):
@@ -192,7 +214,7 @@ def _get_session():
     return _sessions.http
 
 
-def post_capture(frame, video_path=None):
+def post_capture(frame, video_path=None, metadata=None):
     video_handle = None
     try:
         ok, buf = cv2.imencode(".jpg", frame, _jpeg_params)
@@ -202,11 +224,12 @@ def post_capture(frame, video_path=None):
         files = {"frame": ("frame.jpg", io.BytesIO(buf.tobytes()), "image/jpeg")}
         if video_path and os.path.isfile(video_path):
             video_handle = open(video_path, "rb")
-            files["video"] = ("clip.mp4", video_handle, "video/mp4")
+            files["video"] = ("clip.avi", video_handle, "video/x-msvideo")
 
         resp = _get_session().post(
             SERVER_URL, headers={"X-Watcher-Mode": "motion_end"},
-            files=files, timeout=REQUEST_TIMEOUT)
+            files=files, data={"clip_metadata": json.dumps(metadata)} if metadata else None,
+            timeout=(10, 120))
         resp.raise_for_status()
 
         if video_path and os.path.isfile(video_path):
@@ -266,13 +289,29 @@ def detect_motion(frame, bgsub, kernel, motion_thresh):
     return area >= motion_thresh, area
 
 
-def send_visit(frame, saved_buffer):
+def send_visit(frame, saved_buffer, metadata=None):
     path, _ = saved_buffer.encode_video()
     try:
-        return post_capture(frame, path)
+        return post_capture(frame, path, metadata)
     finally:
         # A job owns its path. Failed uploads cannot fill the Pi's SD card.
         if path and os.path.exists(path):
+            os.unlink(path)
+
+
+def send_chunk(saved_buffer, metadata):
+    path, ok = saved_buffer.encode_video()
+    if not ok:
+        return None
+    try:
+        with open(path, "rb") as source:
+            response = _get_session().post(BASE_URL + "/camera/clip",
+                files={"video": ("clip.avi", source, "video/x-msvideo")},
+                data={"clip_metadata": json.dumps(metadata)}, timeout=(10, 120))
+            response.raise_for_status()
+            return response.json()
+    finally:
+        if os.path.exists(path):
             os.unlink(path)
 
 
@@ -344,6 +383,7 @@ def main():
     trigger = motion.MotionTrigger()
 
     video_buf = VideoBuffer(BUFFER_SIZE, VIDEO_FPS)
+    session = ClipSession()
     frame_counter = 0
     exited_at = None
     last_heartbeat = 0.0
@@ -398,9 +438,9 @@ def main():
                     consec_clear = 0
                     if resp.get("calibrated") is False:
                         log.warning("server is NOT CALIBRATED: %s", resp.get("reason"))
-                elif resp.get("dishes_found"):
+                elif job_kind == "heartbeat" and resp.get("dishes_found"):
                     consec_clear = 0
-                else:
+                elif job_kind == "heartbeat":
                     consec_clear += 1
                     if consec_clear >= CLEAR_EXIT_N:
                         monitoring_until = 0.0
@@ -426,7 +466,11 @@ def main():
                 event = trigger.update(frame)
 
                 if event == "entered":
-                    video_buf.clear()
+                    # Do not throw away the preceding activity when somebody
+                    # returns during the post-motion tail.
+                    if exited_at is None:
+                        video_buf.clear()
+                    session.touch(now)
                     video_buf.maybe_add(frame, now)
                     exited_at = None
 
@@ -434,17 +478,25 @@ def main():
                     # wait for the person to clear the frame before the shot
                     exited_at = now
 
+            if trigger.state == motion.MOTION:
+                session.touch(now)
+
+            # Flush each bounded minute while activity continues. There is no
+            # unbounded upload queue and capture keeps running during upload.
+            if (video_buf.count >= BUFFER_SIZE or video_buf.duration_seconds >= VIDEO_DURATION) and not capture_job.busy:
+                saved_buffer, video_buf = video_buf, VideoBuffer(BUFFER_SIZE, VIDEO_FPS)
+                job_kind = "chunk"
+                capture_job.submit(send_chunk, saved_buffer, session.metadata(saved_buffer.recorded_at()))
+
             # Encoding and upload must not stop camera reads or motion detection.
             if exited_at is not None and (now - exited_at) >= CAPTURE_DELAY:
-                if trigger.in_cooldown():
-                    exited_at = None
-                    log.info("skipping capture, still in cooldown")
-                elif not capture_job.busy:
+                if not capture_job.busy:
                     exited_at = None
                     trigger.mark_capture()
                     saved_buffer, video_buf = video_buf, VideoBuffer(BUFFER_SIZE, VIDEO_FPS)
                     job_kind = "visit"
-                    capture_job.submit(send_visit, frame.copy(), saved_buffer)
+                    capture_job.submit(send_visit, frame.copy(), saved_buffer,
+                                       session.metadata(saved_buffer.recorded_at()))
                 # A previous job is still finishing: keep one pending visit in
                 # the bounded ring, rather than dropping it or growing a queue.
 
@@ -453,7 +505,7 @@ def main():
                 job_kind = "heartbeat"
                 capture_job.submit(post_heartbeat, frame.copy())
 
-            if trigger.state == motion.IDLE and exited_at is None:
+            if trigger.state == motion.IDLE:
                 time.sleep(IDLE_SLEEP_MS / 1000)
 
     finally:

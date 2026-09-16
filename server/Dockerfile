@@ -15,7 +15,7 @@ FROM python:3.11-slim AS base
 ARG WITH_YOLO=false
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libgl1 libglib2.0-0 \
+      libgl1 libglib2.0-0 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

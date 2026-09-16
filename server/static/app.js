@@ -18,6 +18,12 @@ let currentView = "overview";
 let clipsCache = [];
 let clipFilter = "all";
 let clipLimit = 40;
+let clipsTotal = 0,
+  clipsHasMore = false,
+  clipRequest = 0,
+  clipsLoading = false;
+let reviewClips = [],
+  tagSaving = false;
 let selectedClip = null;
 let snapshot = null;
 let snapshotReceived = 0;
@@ -670,6 +676,11 @@ function initials(name) {
 
 function renderRoster(list, counts) {
   peopleCache = list;
+  const filter = $("clip-person-filter");
+  const chosen = filter.value;
+  filter.replaceChildren(new Option("Everyone", ""));
+  for (const person of list) filter.add(new Option(person.name, person.id));
+  filter.value = chosen;
   const el = $("roster");
   const sig = JSON.stringify([list, counts]);
   if (el.dataset.sig === sig) return;
@@ -773,15 +784,29 @@ function pickPhoto(pid) {
 }
 
 function renderClips(clips) {
+  // Sessions stay newest-first, but their parts play in chronological order.
+  const sessions = new Map();
+  for (const clip of clips) {
+    const key = clip.session_id || clip.filename;
+    if (!sessions.has(key)) sessions.set(key, []);
+    sessions.get(key).push(clip);
+  }
+  clips = [...sessions.values()].flatMap((group) =>
+    group.sort((a, b) => (a.part || 0) - (b.part || 0)),
+  );
   clipsCache = clips;
-  setText("nav-clip-count", clips.length, { animate: false });
+  setText("nav-clip-count", clipsTotal, { animate: false });
   const filtered = clips.filter(
-    (c) => clipFilter === "all" || (clipFilter === "tagged" ? !!c.tag : !c.tag),
+    (c) =>
+      (clipFilter === "all" || (clipFilter === "tagged" ? !!c.tag : !c.tag)) &&
+      (!$("clip-person-filter").value ||
+        c.tag?.person_id === $("clip-person-filter").value),
   );
   const visible = currentView === "overview" ? filtered.slice(0, 6) : filtered;
-  setText("clip-count", filtered.length, { animate: false });
-  $("more-clips").hidden =
-    currentView !== "clips" || clips.length < clipLimit || clipLimit >= 200;
+  setText("clip-count", clipsTotal, { animate: false });
+  $("clip-results").textContent =
+    `Showing ${visible.length} of ${clipsTotal} matching clips · kept for 14 days`;
+  $("more-clips").hidden = currentView !== "clips" || !clipsHasMore;
   const el = $("clips");
   const sig = JSON.stringify([currentView, clipFilter, visible]);
   if (el.dataset.sig === sig) return;
@@ -790,15 +815,34 @@ function renderClips(clips) {
   if (!visible.length) {
     const empty = document.createElement("div");
     empty.className = "empty";
-    empty.textContent = clips.length
-      ? "No " +
-        clipFilter +
-        " clips in this batch. Try another filter or load more."
-      : "No clips yet. Your next sink visit will appear here.";
+    empty.textContent =
+      "No clips match these filters. Try another day or roommate, or clear the filters.";
     el.append(empty);
     return;
   }
+  let previousGroup = null;
   for (const c of visible) {
+    const day = c.filename.slice(0, 8);
+    const group = day + ":" + (c.session_id || "visits");
+    if (group !== previousGroup) {
+      const heading = document.createElement("h3");
+      heading.className = "clip-group";
+      const date = new Date(
+        Number(day.slice(0, 4)),
+        Number(day.slice(4, 6)) - 1,
+        Number(day.slice(6, 8)),
+      );
+      heading.textContent = date.toLocaleDateString([], {
+        weekday: "short",
+        month: "short",
+        day: "numeric",
+      });
+      const detail = document.createElement("small");
+      detail.textContent = c.session_id ? "Cooking session" : "Sink visits";
+      heading.append(detail);
+      el.append(heading);
+      previousGroup = group;
+    }
     const card = document.createElement("article");
     card.className = "clip";
     const preview = document.createElement("button");
@@ -817,6 +861,12 @@ function renderClips(clips) {
     play.className = "clip-play";
     play.innerHTML = '<span aria-hidden="true">▶</span>';
     preview.append(play);
+    if (c.duration_seconds) {
+      const duration = document.createElement("span");
+      duration.className = "clip-duration";
+      duration.textContent = humanDuration(c.duration_seconds);
+      preview.append(duration);
+    }
     preview.onclick = () => openClip(c);
     const meta = document.createElement("div");
     meta.className = "meta";
@@ -828,9 +878,11 @@ function renderClips(clips) {
     const person = document.createElement("span");
     person.textContent = c.tag ? c.tag.name : "Not tagged yet";
     const size = document.createElement("span");
-    size.textContent = c.size_kb
-      ? (c.size_kb / 1024).toFixed(1) + " MB"
-      : "Sink visit";
+    size.textContent = c.part
+      ? "Part " + c.part
+      : c.size_kb
+        ? (c.size_kb / 1024).toFixed(1) + " MB"
+        : "Sink visit";
     tags.append(person, size);
     meta.append(when, tags);
     card.append(preview, meta);
@@ -838,7 +890,16 @@ function renderClips(clips) {
   }
 }
 
-function openClip(clip) {
+function openClip(clip, keepQueue = false) {
+  if (tagSaving) return;
+  if (!keepQueue)
+    reviewClips = clipsCache.filter(
+      (c) =>
+        (clipFilter === "all" ||
+          (clipFilter === "tagged" ? !!c.tag : !c.tag)) &&
+        (!$("clip-person-filter").value ||
+          c.tag?.person_id === $("clip-person-filter").value),
+    );
   selectedClip = clip;
   setLive(false);
   const vid = $("clip-player");
@@ -848,11 +909,66 @@ function openClip(clip) {
   vid.src = clip.url;
   $("clip-original").href = clip.url;
   updateClipPeople();
-  $("clip-dialog").showModal();
+  if (!$("clip-dialog").open) $("clip-dialog").showModal();
+  vid.playbackRate = Number($("clip-speed").value);
+  updateReviewControls();
   vid.play().catch(() => {
     /* Native play control remains available. */
   });
 }
+
+function updateReviewControls() {
+  const index = reviewClips.findIndex(
+    (c) => c.filename === selectedClip?.filename,
+  );
+  $("previous-clip").disabled = tagSaving || index <= 0;
+  $("next-clip").disabled =
+    tagSaving || index < 0 || index >= reviewClips.length - 1;
+  $("clip-position").textContent = selectedClip
+    ? `${index + 1} / ${reviewClips.length} loaded clips`
+    : "";
+}
+function moveClip(delta) {
+  if (tagSaving) return;
+  const index = reviewClips.findIndex(
+    (c) => c.filename === selectedClip?.filename,
+  );
+  if (index >= 0 && reviewClips[index + delta])
+    openClip(reviewClips[index + delta], true);
+}
+$("previous-clip").onclick = () => moveClip(-1);
+$("next-clip").onclick = () => moveClip(1);
+$("clip-speed").onchange = () => {
+  $("clip-player").playbackRate = Number($("clip-speed").value);
+};
+$("clip-player").onloadedmetadata = () => {
+  $("clip-player").playbackRate = Number($("clip-speed").value);
+};
+$("clip-player").onended = () => {
+  if ($("clip-autonext").checked) moveClip(1);
+};
+document.addEventListener("keydown", (event) => {
+  if (
+    !$("clip-dialog").open ||
+    /INPUT|SELECT|TEXTAREA/.test(event.target.tagName) ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.altKey
+  )
+    return;
+  const key = event.key.toLowerCase();
+  if (!["n", "p", "j", "l"].includes(key)) return;
+  event.preventDefault();
+  if (key === "n" || key === "p") moveClip(key === "n" ? 1 : -1);
+  else {
+    const video = $("clip-player");
+    if (Number.isFinite(video.duration))
+      video.currentTime = Math.max(
+        0,
+        Math.min(video.duration, video.currentTime + (key === "j" ? -10 : 10)),
+      );
+  }
+});
 
 function updateClipPeople() {
   if (!selectedClip) return;
@@ -875,25 +991,41 @@ $("clip-player").onerror = () => {
 };
 $("clip-person").onchange = async () => {
   if (!selectedClip) return;
+  const target = selectedClip;
   const sel = $("clip-person");
+  const value = sel.value;
+  tagSaving = true;
+  updateReviewControls();
   sel.disabled = true;
   try {
-    await post("/clips/" + encodeURIComponent(selectedClip.filename) + "/tag", {
-      person_id: sel.value || null,
+    await post("/clips/" + encodeURIComponent(target.filename) + "/tag", {
+      person_id: value || null,
     });
-    selectedClip.tag = sel.value
+    target.tag = value
       ? {
-          person_id: sel.value,
-          name: peopleCache.find((p) => p.id === sel.value)?.name,
+          person_id: value,
+          name: peopleCache.find((p) => p.id === value)?.name,
         }
       : null;
     toast(sel.value ? "Roommate tagged" : "Tag cleared");
-    await Promise.all([loadClips(), loadPeople()]);
+    const stillMatches =
+      (clipFilter === "all" ||
+        (clipFilter === "tagged" ? !!target.tag : !target.tag)) &&
+      (!$("clip-person-filter").value ||
+        target.tag?.person_id === $("clip-person-filter").value);
+    if (!stillMatches) clipsTotal = Math.max(0, clipsTotal - 1);
+    clipsCache = clipsCache
+      .map((c) => (c.filename === target.filename ? target : c))
+      .filter((c) => c.filename !== target.filename || stillMatches);
+    renderClips(clipsCache);
+    await loadPeople();
   } catch (e) {
     updateClipPeople();
     toast("Could not save the tag: " + e.message);
   } finally {
+    tagSaving = false;
     sel.disabled = false;
+    updateReviewControls();
   }
 };
 
@@ -909,20 +1041,43 @@ async function loadPeople() {
   }
 }
 
-async function loadClips() {
+async function loadClips(append = false) {
+  if (append && clipsLoading) return;
+  const request = ++clipRequest;
+  clipsLoading = true;
+  $("more-clips").disabled = true;
+  const params = new URLSearchParams({
+    limit: String(clipLimit),
+    offset: String(append ? clipsCache.length : 0),
+  });
+  if ($("clip-day").value) params.set("day", $("clip-day").value);
+  if ($("clip-person-filter").value)
+    params.set("person", $("clip-person-filter").value);
+  if (clipFilter !== "all")
+    params.set("tagged", String(clipFilter === "tagged"));
   try {
-    const r = await fetch("/clips?limit=" + clipLimit, {
+    const r = await fetch("/clips?" + params, {
       credentials: "same-origin",
       signal: AbortSignal.timeout(10000),
     });
     if (!r.ok) throw new Error("Clips could not be loaded (" + r.status + ")");
     const d = await r.json();
-    renderClips(d.clips || []);
+    if (request !== clipRequest) return;
+    clipsTotal = d.total ?? (d.clips || []).length;
+    clipsHasMore = !!d.has_more;
+    const merged = append ? [...clipsCache, ...(d.clips || [])] : d.clips || [];
+    renderClips([...new Map(merged.map((c) => [c.filename, c])).values()]);
     $("clips-error").hidden = true;
   } catch (e) {
+    if (request !== clipRequest) return;
     $("clips-error").textContent =
       "Couldn’t refresh clips. Your last results are still here. Try Refresh.";
     $("clips-error").hidden = false;
+  } finally {
+    if (request === clipRequest) {
+      clipsLoading = false;
+      $("more-clips").disabled = false;
+    }
   }
 }
 
@@ -1187,13 +1342,17 @@ document.querySelectorAll("[data-filter]").forEach(
         b.classList.toggle("active", b === btn);
         b.setAttribute("aria-pressed", String(b === btn));
       });
-      renderClips(clipsCache);
+      loadClips();
     }),
 );
-$("refresh-clips").onclick = loadClips;
-$("more-clips").onclick = () => {
-  clipLimit = Math.min(200, clipLimit + 40);
-  loadClips();
+$("refresh-clips").onclick = () => loadClips();
+$("more-clips").onclick = () => loadClips(true);
+$("clip-day").onchange = () => loadClips();
+$("clip-person-filter").onchange = () => loadClips();
+$("clear-clip-filters").onclick = () => {
+  $("clip-day").value = "";
+  $("clip-person-filter").value = "";
+  document.querySelector('[data-filter="all"]').click();
 };
 $("person-form").onsubmit = (e) => e.preventDefault();
 $("today").textContent = new Date().toLocaleDateString([], {
@@ -1221,7 +1380,8 @@ $("today").textContent = new Date().toLocaleDateString([], {
   loadPeople().then(loadClips);
   // clips only change when somebody walks past the sink, so this is unhurried
   setInterval(() => {
-    if (!document.hidden) loadClips();
+    if (!document.hidden && currentView !== "clips" && !$("clip-dialog").open)
+      loadClips();
   }, 30000);
   setInterval(() => {
     if (lastGoodAt && Date.now() - lastGoodAt > 15000) markStale();

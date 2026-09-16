@@ -2,6 +2,7 @@
 # videos now get a thumbnail jpg and proper time/date labeling
 
 import logging
+import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -49,14 +50,14 @@ def save_frame(frame, dishes_found, state="", quality=90):
 
 
 def save_video(video_bytes, original_filename="clip.mp4",
-               first_frame=None, rotation=None):
+               first_frame=None, rotation=None, metadata=None):
     """
     Save a video clip + generate a thumbnail. first_frame is already oriented;
     rotation applies only when extracting an unprocessed video frame.
     returns (video_filename, thumb_filename).
     """
     now = datetime.now()
-    ts = now.strftime("%Y%m%d_%H%M%S")
+    ts = now.strftime("%Y%m%d_%H%M%S_%f")
     ext = os.path.splitext(original_filename)[1] or ".mp4"
     video_filename = f"{ts}_blame{ext}"
     thumb_filename = f"{ts}_blame_thumb.jpg"
@@ -67,6 +68,8 @@ def save_video(video_bytes, original_filename="clip.mp4",
     # save video
     with open(video_path, "wb") as f:
         f.write(video_bytes)
+    if metadata:
+        Path(video_path + ".json").write_text(json.dumps(metadata))
     size_kb = len(video_bytes) / 1024
     log.info("video: %s (%.0f KB)", video_filename, size_kb)
 
@@ -150,15 +153,27 @@ def list_videos(limit=20):
 
     results = []
     for f in files[:limit]:
+        recorded_at = None
         try:
             dt = datetime.strptime(f[:15], "%Y%m%d_%H%M%S")
+            recorded_at = dt.isoformat()
             time_str = dt.strftime("%I:%M %p")
             date_str = dt.strftime("%b %d")
             ts_display = f"{time_str}, {date_str}"
         except ValueError:
             ts_display = f
 
-        size = os.path.getsize(os.path.join(_vid_dir, f))
+        try:
+            size = os.path.getsize(os.path.join(_vid_dir, f))
+        except FileNotFoundError:
+            continue  # A retention sweep may remove a clip during this listing.
+        metadata = {}
+        try:
+            metadata = json.loads(Path(_vid_dir, f + ".json").read_text())
+            if not isinstance(metadata, dict):
+                metadata = {}
+        except (OSError, ValueError):
+            pass
 
         # check for matching thumbnail
         thumb_name = f.rsplit(".", 1)[0] + "_thumb.jpg"
@@ -173,6 +188,10 @@ def list_videos(limit=20):
             "size_kb": round(size / 1024),
             "url": f"/view/video/{f}",
             "thumb_url": thumb_url,
+            "recorded_at": metadata.get("recorded_at") or recorded_at,
+            "duration_seconds": metadata.get("duration_seconds"),
+            "session_id": metadata.get("session_id"),
+            "part": metadata.get("part"),
         })
     return results
 
@@ -255,7 +274,7 @@ def enforce_retention(clip_days, image_days):
 
     for directory, days, key in ((_vid_dir, clip_days, "clips"),
                                  (_img_dir, image_days, "images"),
-                                 (_thumb_dir, image_days, "images")):
+                                 (_thumb_dir, clip_days, "images")):
         if not directory or days <= 0:
             continue
         cutoff = now - days * 86400
@@ -263,16 +282,17 @@ def enforce_retention(clip_days, image_days):
         if not p.exists():
             continue
         for f in p.glob("*"):
-            if not f.is_file():
+            if not f.is_file() or f.is_symlink():
                 continue
             try:
                 st = f.stat()
                 if st.st_mtime < cutoff:
                     size = st.st_size
                     f.unlink()
-                    if key == "clips":
+                    if key == "clips" and f.suffix.lower() in (".mp4", ".avi"):
                         removed["removed_clips"].append(f.name)
-                    removed[key] += 1
+                    if f.suffix != ".json":
+                        removed[key] += 1
                     removed["bytes"] += size
             except OSError as e:
                 log.warning("retention could not remove %s: %s", f, e)

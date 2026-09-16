@@ -6,7 +6,21 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "camera"))
-from edge_runtime import SingleJob, preview_fps, small_frame, temperature_c
+from edge_runtime import ClipSession, SingleJob, preview_fps, small_frame, temperature_c
+
+
+def test_cooking_visits_group_until_the_quiet_gap():
+    session = ClipSession(gap_seconds=180)
+    session.touch(100)
+    first = session.metadata("2026-09-16T10:00:00+00:00")
+    session.touch(200)
+    second = session.metadata("2026-09-16T10:01:00+00:00")
+    assert first["session_id"] == second["session_id"]
+    assert (first["part"], second["part"]) == (1, 2)
+    session.touch(381)
+    third = session.metadata("2026-09-16T10:04:00+00:00")
+    assert third["session_id"] != first["session_id"]
+    assert third["part"] == 1
 
 
 @pytest.mark.parametrize("temp,fps", [(50, 2), (60, 1), (70, .5), (75, 0), (None, 1)])
