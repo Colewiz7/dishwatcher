@@ -31,6 +31,38 @@ def test_temperature_sensor_absent_or_malformed(tmp_path):
     assert temperature_c(path) is None
 
 
+@pytest.mark.parametrize("bad", ["nan", "inf", "-1000", "999999"])
+def test_invalid_temperature_uses_safe_fallback(tmp_path, bad):
+    path = tmp_path / "temp"
+    path.write_text(bad)
+    assert temperature_c(path) is None
+    assert preview_fps(2, temperature_c(path)) == 1
+
+
+def test_odd_camera_dimensions_remain_encodable():
+    frame = np.zeros((359, 639, 3), dtype=np.uint8)
+    output = small_frame(frame)
+    assert output.shape == (358, 638, 3)
+    assert frame.shape == (359, 639, 3)
+
+
+def test_failed_background_job_releases_slot(caplog):
+    def fail():
+        raise RuntimeError("encoder failed")
+    worker = SingleJob("test-error")
+    try:
+        worker.submit(fail)
+        with pytest.raises(RuntimeError):
+            worker.future.result(timeout=2)
+        assert worker.take() == (True, None)
+        assert "background camera job failed" in caplog.text
+        assert worker.submit(lambda: "recovered")
+        worker.future.result(timeout=2)
+        assert worker.take() == (True, "recovered")
+    finally:
+        worker.close()
+
+
 def test_background_work_never_accumulates_frames():
     gate = threading.Event()
     worker = SingleJob("test")

@@ -962,30 +962,40 @@ let liveTimer,
   liveURL = null,
   liveStarted = 0;
 let liveFrameAt = 0,
-  liveSeq = null;
+  liveFrameId = null;
 async function liveTick(generation) {
   if (!liveOn || document.hidden || generation !== liveGeneration) return;
-  liveAbort = new AbortController();
-  const timeout = setTimeout(() => liveAbort?.abort(), 8000);
-  let delay = 500;
+  const controller = new AbortController();
+  liveAbort = controller;
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  const fps = snapshot?.camera?.preview_fps_limit ?? 2;
+  let delay = Math.min(2000, Math.max(500, 1000 / (fps || 0.5)));
   try {
-    const r = await fetch("/live.jpg?t=" + Date.now(), {
-      cache: "no-store",
-      signal: liveAbort.signal,
-    });
+    const r = await fetch(
+      "/live.jpg" +
+        (liveFrameId ? "?after=" + encodeURIComponent(liveFrameId) : ""),
+      {
+        cache: "no-store",
+        signal: controller.signal,
+      },
+    );
     if (!r.ok)
       throw new Error(
         r.status === 401 || r.status === 403
           ? "Sign in again to view the camera."
           : "Waiting for the camera",
       );
-    if (!r.headers.get("content-type")?.includes("image/jpeg"))
+    if (
+      r.status !== 204 &&
+      !r.headers.get("content-type")?.includes("image/jpeg")
+    )
       throw new Error("Sign in again to view the camera.");
-    const seq = r.headers.get("X-Frame-Seq");
+    const frameId = r.headers.get("X-Frame-Id");
     const frameAt = Number(r.headers.get("X-Frame-At")) * 1000;
-    const blob = await r.blob();
     if (!liveOn || generation !== liveGeneration) return;
-    if (seq !== liveSeq) {
+    if (r.status !== 204) {
+      const blob = await r.blob();
+      if (!liveOn || generation !== liveGeneration) return;
       const url = URL.createObjectURL(blob);
       const check = new Image();
       check.src = url;
@@ -1006,7 +1016,7 @@ async function liveTick(generation) {
       $("frame").hidden = true;
       $("camera-empty").hidden = true;
       if (previous) URL.revokeObjectURL(previous);
-      liveSeq = seq;
+      liveFrameId = frameId;
     }
     liveFrameAt = frameAt;
     pill(
@@ -1015,9 +1025,7 @@ async function liveTick(generation) {
       Date.now() - frameAt < 4000 ? "Live" : "Delayed",
     );
     $("live-message").textContent =
-      "Low-bandwidth preview · " +
-      (snapshot?.camera?.preview_fps_limit || 2) +
-      " fps limit";
+      "Low-bandwidth preview · " + fps + " fps limit";
     $("frame-age").textContent =
       "Frame received " + humanDuration((Date.now() - frameAt) / 1000) + " ago";
   } catch (e) {
@@ -1060,7 +1068,7 @@ function setLive(enabled) {
     $("live").removeAttribute("src");
     if (liveURL) URL.revokeObjectURL(liveURL);
     liveURL = null;
-    liveSeq = null;
+    liveFrameId = null;
     liveFrameAt = 0;
     $("frame").hidden = !$("frame").naturalWidth;
     pill($("live-badge"), "mute", "Snapshot");
@@ -1163,7 +1171,8 @@ window.addEventListener("hashchange", navigate);
 document.querySelectorAll('a[href^="#"]').forEach((link) => {
   if (!viewCopy[link.hash.slice(1)]) return;
   link.addEventListener("click", (event) => {
-    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey)
+      return;
     event.preventDefault();
     if (location.hash === link.hash) navigate();
     else location.hash = link.hash;

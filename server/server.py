@@ -134,11 +134,12 @@ EVENTS = deque(maxlen=60)
 # behind NAT), so the browser cannot pull from it directly. Instead the server
 # holds a "live wanted until" deadline; the camera reads that off every health
 # report and, while it is in the future, pushes frames here at LIVE_FPS. The
-# browser consumes them as multipart MJPEG.
+# browser consumes complete JPEGs, with a legacy multipart endpoint too.
 #
 # The deadline auto-expires so a closed browser tab cannot leave the Pi
 # streaming forever and burning its USB bus and battery of CPU.
 LIVE = {"wanted_until": 0.0, "frame": None, "frame_at": 0.0, "seq": 0}
+LIVE_LOCK = asyncio.Lock()
 LIVE_LEASE_SEC = float(os.environ.get("LIVE_LEASE_SEC", "45"))
 LIVE_FPS = min(4.0, max(0.5, float(os.environ.get("LIVE_FPS", "2"))))
 
@@ -312,6 +313,21 @@ def _decode_frame(raw):
     return frame
 
 
+def _prepare_live_frame(raw):
+    # Match detection/reference orientation, once per incoming frame, on the
+    # server. Do not make the Pi rotate full-resolution frames or recalibrate.
+    img = _decode_frame(raw)
+    h, w = img.shape[:2]
+    if max(h, w) > 640:
+        scale = 640 / max(h, w)
+        img = cv2.resize(img, (max(1, round(w * scale)), max(1, round(h * scale))),
+                         interpolation=cv2.INTER_AREA)
+    ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    if not ok:
+        raise HTTPException(422, "couldnt encode preview")
+    return jpeg.tobytes()
+
+
 # -- health --
 
 @app.get("/healthz")
@@ -414,9 +430,14 @@ async def live_frame(frame: UploadFile = File(...),
                      x_api_key: Optional[str] = Header(default=None)):
     """Camera pushes a frame while the live lease is active."""
     _check_api_key(x_api_key)
-    raw = await frame.read()
-    if raw:
-        LIVE["frame"] = raw
+    raw = await frame.read(2 * 1024 * 1024 + 1)
+    if not raw:
+        raise HTTPException(400, "empty preview")
+    if len(raw) > 2 * 1024 * 1024:
+        raise HTTPException(413, "preview exceeds 2 MiB")
+    async with LIVE_LOCK:
+        oriented = await asyncio.to_thread(_prepare_live_frame, raw)
+        LIVE["frame"] = oriented
         LIVE["frame_at"] = time.time()
         LIVE["seq"] += 1
     remaining = max(0.0, LIVE["wanted_until"] - time.time())
@@ -465,7 +486,7 @@ async def live_mjpeg(request: Request):
 
 
 @app.get("/live.jpg")
-async def live_snapshot():
+async def live_snapshot(after: Optional[str] = Query(default=None, max_length=100)):
     """A complete JPEG response works even through proxies that buffer MJPEG.
 
     Reading keeps the camera lease alive. Old frames are never labelled live;
@@ -477,8 +498,14 @@ async def live_snapshot():
     if LIVE["frame"] is None or age is None or age > 10:
         return JSONResponse({"detail": "Waiting for a fresh camera frame", "frame_age": age},
                             status_code=503, headers={**headers, "Retry-After": "2"})
-    return Response(LIVE["frame"], media_type="image/jpeg", headers={
-        **headers, "X-Frame-At": str(LIVE["frame_at"]), "X-Frame-Seq": str(LIVE["seq"])})
+    frame_id = f'{LIVE["seq"]}:{LIVE["frame_at"]}'
+    headers.update({"X-Frame-At": str(LIVE["frame_at"]),
+                    "X-Frame-Seq": str(LIVE["seq"]), "X-Frame-Id": frame_id})
+    # Still renew the viewer lease, but do not resend the same JPEG when the Pi
+    # is thermally limited. The timestamp makes IDs unique across restarts.
+    if after == frame_id:
+        return Response(status_code=204, headers=headers)
+    return Response(LIVE["frame"], media_type="image/jpeg", headers=headers)
 
 
 @app.get("/clips")

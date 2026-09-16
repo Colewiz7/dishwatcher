@@ -12,6 +12,17 @@ retry on failures, and retain the last frame. Frames older than ten seconds are
 refused as live. A camera lease expires 45 seconds after the last viewer request.
 Closing one viewer does not stop another viewer's lease.
 
+Preview uploads now use the same configured server-side rotation as snapshots;
+calibration geometry and the Pi's capture orientation stay unchanged. Rotation
+and JPEG encoding happen once per uploaded preview, not for each viewer. The
+browser polls at the thermal frame-rate limit and sends the last frame ID; an
+unchanged frame returns an empty 204 response while renewing the lease. Frame
+IDs include a timestamp so reconnecting after a server restart cannot reuse an
+old image merely because its sequence number repeats.
+
+New thumbnails are capped at 480 pixels and are not rotated twice when their
+source is an already-oriented detection image. Existing media is untouched.
+
 All media requires dashboard credentials or trusted Authentik identity, regardless
 of the viewer's network. Byte ranges support video seeking. Notification attachments
 remain disabled; the existing notifications link to the authenticated dashboard.
@@ -28,6 +39,11 @@ The server requests at most 2 preview frames per second by default. The edge cap
 preview to 1 fps at 60°C, 0.5 fps at 70°C, and pauses it at 75°C. An unavailable
 sensor caps preview at 1 fps. The existing systemd CPU quota stays in force.
 Temperature and the preview limit appear in camera health reports.
+
+Failed background jobs release their slot without terminating camera capture.
+Encoder jobs own unique temporary files and remove them after upload or failure;
+odd-sized frames are normalized to even dimensions for H.264. Invalid temperature
+readings use the conservative sensor-unavailable limit.
 
 Server image processing and notification I/O run outside the async request loop.
 Uploads remain serialized so state updates preserve order. Clean calibration now

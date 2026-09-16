@@ -51,7 +51,8 @@ def save_frame(frame, dishes_found, state="", quality=90):
 def save_video(video_bytes, original_filename="clip.mp4",
                first_frame=None, rotation=None):
     """
-    save a video clip + generate thumbnail.
+    Save a video clip + generate a thumbnail. first_frame is already oriented;
+    rotation applies only when extracting an unprocessed video frame.
     returns (video_filename, thumb_filename).
     """
     now = datetime.now()
@@ -82,9 +83,15 @@ def save_video(video_bytes, original_filename="clip.mp4",
                 if not ret or thumb is None:
                     return
 
-            # apply rotation to thumbnail too
-            if rotation is not None:
+            if first_frame is None and rotation is not None:
                 thumb = cv2.rotate(thumb, rotation)
+
+            # A gallery thumbnail is not a full-resolution camera capture.
+            h, w = thumb.shape[:2]
+            if max(h, w) > 480:
+                scale = 480 / max(h, w)
+                thumb = cv2.resize(thumb, (max(1, round(w * scale)), max(1, round(h * scale))),
+                                   interpolation=cv2.INTER_AREA)
 
             # burn timestamp into thumbnail
             h, w = thumb.shape[:2]

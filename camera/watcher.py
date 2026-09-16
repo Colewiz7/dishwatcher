@@ -136,7 +136,9 @@ class VideoBuffer:
             return None, False
 
         tmpdir = tempfile.mkdtemp(prefix="blame_")
-        mp4_path = os.path.join(tempfile.gettempdir(), "blame_clip.mp4")
+        fd, mp4_path = tempfile.mkstemp(prefix="dishwatcher-clip-", suffix=".mp4")
+        os.close(fd)
+        encoded = False
 
         try:
             for i, jpeg_bytes in enumerate(self._buf):
@@ -153,9 +155,10 @@ class VideoBuffer:
             ]
             r = subprocess.run(cmd, capture_output=True, timeout=60)
 
-            if r.returncode == 0 and os.path.isfile(mp4_path):
+            if r.returncode == 0 and os.path.isfile(mp4_path) and os.path.getsize(mp4_path) > 0:
                 size_kb = os.path.getsize(mp4_path) / 1024
                 log.info("video: h264 mp4 (%.0f KB, %d frames)", size_kb, len(self._buf))
+                encoded = True
                 return mp4_path, True
             else:
                 log.warning("ffmpeg failed: %s", (r.stderr or b"")[-300:].decode(errors="replace"))
@@ -168,6 +171,8 @@ class VideoBuffer:
             return None, False
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+            if not encoded and os.path.exists(mp4_path):
+                os.unlink(mp4_path)
 
     def clear(self):
         self._buf.clear()
@@ -261,6 +266,16 @@ def detect_motion(frame, bgsub, kernel, motion_thresh):
     return area >= motion_thresh, area
 
 
+def send_visit(frame, saved_buffer):
+    path, _ = saved_buffer.encode_video()
+    try:
+        return post_capture(frame, path)
+    finally:
+        # A job owns its path. Failed uploads cannot fill the Pi's SD card.
+        if path and os.path.exists(path):
+            os.unlink(path)
+
+
 # -- main --
 
 def post_live_frame(frame, quality=55):
@@ -346,10 +361,6 @@ def main():
     job_kind = None
     temp = temperature_c()
     last_temp_check = 0.0
-
-    def send_visit(frame, saved_buffer):
-        path, _ = saved_buffer.encode_video()
-        return post_capture(frame, path)
 
     log.info("running")
 

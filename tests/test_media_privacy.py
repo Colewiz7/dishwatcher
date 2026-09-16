@@ -102,6 +102,59 @@ def test_camera_upload_still_requires_api_key(srv, monkeypatch):
     assert response.status_code == 401
 
 
+@pytest.mark.parametrize("rotation", [None, 0, 1, 2])
+def test_live_orientation_matches_snapshot_processing(srv, monkeypatch, rotation):
+    import cv2
+    import numpy as np
+    live = {"wanted_until": time.time() + 45, "frame": None, "frame_at": 0, "seq": 0}
+    monkeypatch.setattr(srv, "LIVE", live)
+    monkeypatch.setattr(srv, "API_KEY", "test-camera")
+    monkeypatch.setattr(srv, "_get_rotation", lambda: rotation)
+    original = np.zeros((80, 120, 3), np.uint8)
+    original[:40, :60] = (0, 0, 255)
+    original[40:, :60] = (255, 0, 0)
+    original[:40, 60:] = (0, 255, 0)
+    ok, jpeg = cv2.imencode(".jpg", original)
+    assert ok
+    response = request(srv, "/live/frame", method="POST", headers={"X-API-Key": "test-camera"},
+                       files={"frame": ("live.jpg", jpeg.tobytes(), "image/jpeg")})
+    assert response.status_code == 200
+    actual = cv2.imdecode(np.frombuffer(live["frame"], np.uint8), cv2.IMREAD_COLOR)
+    expected = srv._decode_frame(jpeg.tobytes())
+    assert actual.shape == expected.shape
+    assert np.abs(actual.astype(float) - expected).mean() < 5
+    assert live["seq"] == 1
+
+
+@pytest.mark.parametrize("payload,status", [(b"", 400), (b"not a jpeg", 422), (b"x" * (2 * 1024 * 1024 + 1), 413)])
+def test_bad_preview_never_replaces_last_good_frame(srv, monkeypatch, payload, status):
+    live = {"wanted_until": 0, "frame": b"last good", "frame_at": 123, "seq": 9}
+    monkeypatch.setattr(srv, "LIVE", live)
+    monkeypatch.setattr(srv, "API_KEY", "test-camera")
+    response = request(srv, "/live/frame", method="POST", headers={"X-API-Key": "test-camera"},
+                       files={"frame": ("live.jpg", payload, "image/jpeg")})
+    assert response.status_code == status
+    assert live["frame"] == b"last good"
+    assert live["seq"] == 9
+
+
+def test_unchanged_preview_renews_lease_without_resending_jpeg(srv, monkeypatch):
+    live = {"wanted_until": 0, "frame": b"jpeg", "frame_at": time.time(), "seq": 7}
+    monkeypatch.setattr(srv, "LIVE", live)
+    first = request(srv, "/live.jpg", headers=BASIC)
+    token = first.headers["x-frame-id"]
+    response = request(srv, "/live.jpg", params={"after": token}, headers=BASIC)
+    assert response.status_code == 204
+    assert response.content == b""
+    assert live["wanted_until"] > time.time()
+    assert request(srv, "/live.jpg", params={"after": token}).status_code == 401
+    # Sequence numbers can repeat after a restart; timestamps must distinguish them.
+    live["frame_at"] += 0.001
+    assert request(srv, "/live.jpg", params={"after": token}, headers=BASIC).status_code == 200
+    live["frame_at"] -= 30
+    assert request(srv, "/live.jpg", params={"after": token}, headers=BASIC).status_code == 503
+
+
 def test_camera_report_ages_between_reports(srv, monkeypatch):
     from datetime import datetime, timedelta, timezone
     monkeypatch.setattr(srv, "CAMERA", {"seen": True, "stats": {"seconds_since_last_frame": 1},

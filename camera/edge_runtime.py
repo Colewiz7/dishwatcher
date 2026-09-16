@@ -1,8 +1,12 @@
 """Bounded background work and inexpensive preview frames for the Pi."""
 from concurrent.futures import ThreadPoolExecutor
+import logging
+import math
 from pathlib import Path
 
 import cv2
+
+log = logging.getLogger("dishwatcher.edge")
 
 
 class SingleJob:
@@ -25,7 +29,13 @@ class SingleJob:
         if self.future is None or not self.future.done():
             return False, None
         future, self.future = self.future, None
-        return True, future.result()
+        try:
+            return True, future.result()
+        except Exception:
+            # A failed upload/encoder must not kill camera acquisition or
+            # permanently occupy the single slot. The next job can recover.
+            log.exception("background camera job failed")
+            return True, None
 
     def close(self):
         self.executor.shutdown(wait=True, cancel_futures=True)
@@ -33,7 +43,8 @@ class SingleJob:
 
 def temperature_c(path="/sys/class/thermal/thermal_zone0/temp"):
     try:
-        return float(Path(path).read_text().strip()) / 1000
+        value = float(Path(path).read_text().strip()) / 1000
+        return value if math.isfinite(value) and 0 <= value <= 150 else None
     except (OSError, ValueError):
         return None
 
@@ -54,8 +65,8 @@ def preview_fps(requested, temperature):
 def small_frame(frame, max_width=640):
     """Keep the aspect ratio and even dimensions for H.264; never upscale."""
     h, w = frame.shape[:2]
-    if w <= max_width:
-        return frame
-    width = max(2, (max_width // 2) * 2)
+    width = max(2, (min(w, max_width) // 2) * 2)
     height = max(2, (round(h * width / w) // 2) * 2)
+    if (w, h) == (width, height):
+        return frame
     return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)

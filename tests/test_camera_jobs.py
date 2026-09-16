@@ -1,0 +1,55 @@
+"""Exercise edge encoder failures without a camera, network, or ffmpeg process."""
+import importlib
+import signal
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "camera"))
+
+
+@pytest.fixture
+def watcher(monkeypatch, tmp_path):
+    # Importing the daemon must not replace pytest's process signal handlers.
+    monkeypatch.setattr(signal, "signal", lambda *args: None)
+    module = importlib.import_module("watcher")
+    monkeypatch.setattr(module.tempfile, "tempdir", str(tmp_path))
+    return module
+
+
+@pytest.mark.parametrize("result", ["error", "empty", "timeout"])
+def test_failed_encoder_leaves_no_temporary_files(watcher, monkeypatch, tmp_path, result):
+    def run(*args, **kwargs):
+        if result == "timeout":
+            raise watcher.subprocess.TimeoutExpired("ffmpeg", 60)
+        return SimpleNamespace(returncode=1 if result == "error" else 0, stderr=b"test")
+    monkeypatch.setattr(watcher.subprocess, "run", run)
+    buffer = watcher.VideoBuffer(5, 5)
+    buffer._buf.extend([b"jpeg"] * 5)
+    assert buffer.encode_video() == (None, False)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_encoder_owns_unique_outputs_and_uses_one_thread(watcher, monkeypatch, tmp_path):
+    def run(cmd, **kwargs):
+        assert cmd[cmd.index("-threads") + 1] == "1"
+        Path(cmd[-1]).write_bytes(b"mp4")
+        return SimpleNamespace(returncode=0, stderr=b"")
+    monkeypatch.setattr(watcher.subprocess, "run", run)
+    buffer = watcher.VideoBuffer(5, 5)
+    buffer._buf.extend([b"jpeg"] * 5)
+    first, ok = buffer.encode_video()
+    second, ok2 = buffer.encode_video()
+    assert ok and ok2 and first != second
+    assert set(tmp_path.iterdir()) == {Path(first), Path(second)}
+
+
+def test_failed_upload_releases_owned_clip(watcher, monkeypatch, tmp_path):
+    path = tmp_path / "own-clip.mp4"
+    path.write_bytes(b"mp4")
+    buffer = SimpleNamespace(encode_video=lambda: (str(path), True))
+    monkeypatch.setattr(watcher, "post_capture", lambda *args: None)
+    assert watcher.send_visit(None, buffer) is None
+    assert not path.exists()
