@@ -1,17 +1,24 @@
-# detector.py - v5 detection engine
-# primary detection: compare current frame against a "clean" reference using SSIM
-# secondary (optional): run yolo to label what's actually there
-# counter detection (optional): separate ROI for counter area
+# detector.py - v2 detection engine.
 #
-# way more reliable than yolo-only because SSIM catches everything:
-# pots, pans, cutting boards, random shit piled up. yolo only knows
-# specific coco classes. SSIM just asks "does this look different from clean?"
+# Two things changed from v1, both because of what the 15-day log showed.
+#
+# 1. SSIM is scored by a low percentile of the map, not a whole-ROI mean. v1 returned ssim_map.mean() over the
+#    entire sink. A single mug in a big sink moves that mean by almost nothing,
+#    so the 0.82 threshold was really a function of how big the ROI was. Now the
+#    ROI is cut into a grid and the *worst* tile decides. One dirty corner is
+#    enough, which is the actual question being asked.
+#
+# 2. There is no silent fallback. If calibration is not usable the detector
+#    raises NotCalibrated. It does not return a default score that happens to
+#    read as clean. Callers must handle the uncalibrated case explicitly.
+#
+# YOLO stays optional and stays a *labeller*. It never decides dirty/clean.
+# In v1 it silently became the only decider, and COCO only has bowl and cup,
+# which is why 15 days of production only ever produced those two labels.
 
-import json
 import logging
 import os
 import time
-from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -19,45 +26,29 @@ import numpy as np
 
 log = logging.getLogger("dishwatcher.detector")
 
-# -- config --
-YOLO_ENABLED     = os.environ.get("YOLO_ENABLED", "true").lower() == "true"
-SSIM_THRESHOLD   = float(os.environ.get("SSIM_THRESHOLD", "0.82"))
-COUNTER_ENABLED  = os.environ.get("COUNTER_ENABLED", "false").lower() == "true"
-COUNTER_SSIM     = float(os.environ.get("COUNTER_SSIM_THRESHOLD", "0.80"))
-
-# paths
-_DATA_DIR    = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent)))
-_REF_PATH    = _DATA_DIR / "reference.jpg"
-_ROI_PATH    = _DATA_DIR / "roi.json"
-_MODEL_PATH  = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
-_CONFIDENCE  = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.40"))
-
-# coco classes for yolo labeling
-DISH_CLASSES = {41: "cup", 42: "fork", 43: "knife", 44: "spoon", 45: "bowl"}
-SINK_CLASS   = 71
-ALL_CLASSES  = {**DISH_CLASSES, SINK_CLASS: "sink"}
-YOLO_CLASS_IDS = list(ALL_CLASSES.keys())
-
-# annotation colors (rgb for pillow, bgr for opencv)
-CLR_DIRTY  = (0, 0, 255)     # red
-CLR_CLEAN  = (0, 200, 0)     # green
-CLR_SINK   = (246, 130, 59)  # blue
-CLR_COUNTER = (255, 165, 0)  # orange
-
-# font
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-
-# state
-_model = None
-_reference = None  # the "clean sink" reference image
-_roi = None        # {"sink": [x1,y1,x2,y2], "counter": [x1,y1,x2,y2] (optional)}
+# tiles across the sink ROI. 4x4 keeps each tile big enough for an 11px gaussian
+# window at typical ROI sizes while still localising a single-plate change.
+TILE_GRID = int(os.environ.get("SSIM_TILE_GRID", "4"))
+# a tile smaller than this cannot host the SSIM window; grid shrinks to fit.
+MIN_TILE_EDGE = 24
+# percentile of the SSIM map used as the score. See compute_ssim_tiled.
+SSIM_PERCENTILE = float(os.environ.get("SSIM_PERCENTILE", "2.0"))
+# Gaussian kernel applied before comparison. Must be odd. Set 0 or 1 to disable.
+_dk = int(os.environ.get("SSIM_DENOISE_KERNEL", "5"))
+DENOISE_KERNEL = _dk if _dk % 2 == 1 else _dk + 1
 
 
-# -- ssim implementation --
-# no extra deps needed, just numpy + opencv
+class NotCalibrated(Exception):
+    """Raised instead of silently returning a clean-looking score."""
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
 
-def compute_ssim(img1, img2):
-    """structural similarity between two grayscale images. returns 0-1 (1=identical)"""
+
+# -- ssim --
+
+def _ssim_map(img1, img2):
+    """SSIM map between two single-channel float images. Returns the full map."""
     C1 = (0.01 * 255) ** 2
     C2 = (0.03 * 255) ** 2
 
@@ -67,301 +58,237 @@ def compute_ssim(img1, img2):
     mu1 = cv2.GaussianBlur(i1, (11, 11), 1.5)
     mu2 = cv2.GaussianBlur(i2, (11, 11), 1.5)
 
-    mu1_sq = mu1 ** 2
-    mu2_sq = mu2 ** 2
-    mu1_mu2 = mu1 * mu2
+    mu1_sq, mu2_sq, mu1_mu2 = mu1 ** 2, mu2 ** 2, mu1 * mu2
 
     sig1_sq = cv2.GaussianBlur(i1 ** 2, (11, 11), 1.5) - mu1_sq
     sig2_sq = cv2.GaussianBlur(i2 ** 2, (11, 11), 1.5) - mu2_sq
-    sig12   = cv2.GaussianBlur(i1 * i2, (11, 11), 1.5) - mu1_mu2
+    sig12 = cv2.GaussianBlur(i1 * i2, (11, 11), 1.5) - mu1_mu2
 
     num = (2 * mu1_mu2 + C1) * (2 * sig12 + C2)
     den = (mu1_sq + mu2_sq + C1) * (sig1_sq + sig2_sq + C2)
-
-    ssim_map = num / den
-    return float(ssim_map.mean())
+    return num / den
 
 
-def _prep_for_ssim(img):
-    """grayscale + histogram equalize to handle lighting changes"""
+def compute_ssim_tiled(img1, img2, grid=None, percentile=None):
+    """
+    Returns (score, tiles).
+
+    score is a low PERCENTILE of the SSIM map, not a mean and not a tile
+    minimum. Measured on synthetic sinks (see tests/test_detector.py):
+
+      metric                one mug, 4 positions        half-shadow (must stay clean)
+      v1 whole-ROI mean     0.9886 (misses it entirely)  0.9800
+      4x4 tile worst        0.95 / 0.61 / 0.95 / 0.78    0.8680
+      2nd percentile        0.7808 0.7797 0.7783 0.7809  0.8769
+
+    The tile minimum swings by 0.34 for the same mug depending on whether it
+    lands inside a tile or straddles a boundary. The percentile does not care
+    where the object is, which is the property we actually need. Tiles are
+    still computed, but only to draw the dashboard heatmap.
+
+    percentile 2.0 means "the worst 2% of the ROI differs", i.e. it detects an
+    object covering roughly 2% of the sink. Lower it to catch smaller things at
+    the cost of noise sensitivity.
+    """
+    if img1.shape != img2.shape:
+        img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+
+    smap = _ssim_map(img1, img2)
+    p = SSIM_PERCENTILE if percentile is None else percentile
+    score = float(np.percentile(smap, p))
+
+    # tiles are presentation only; they show WHERE the change is.
+    h, w = smap.shape[:2]
+    g = grid or TILE_GRID
+    g = max(1, min(g, h // MIN_TILE_EDGE, w // MIN_TILE_EDGE)) if (h >= MIN_TILE_EDGE and w >= MIN_TILE_EDGE) else 1
+    tiles = []
+    th, tw = h // g, w // g
+    for r in range(g):
+        for c in range(g):
+            y1, y2 = r * th, ((r + 1) * th if r < g - 1 else h)
+            x1, x2 = c * tw, ((c + 1) * tw if c < g - 1 else w)
+            tiles.append({"row": r, "col": c, "score": round(float(smap[y1:y2, x1:x2].mean()), 4)})
+
+    return score, tiles
+
+
+def prep_for_ssim(img):
+    """
+    Grayscale, CLAHE, then denoise.
+
+    v1 used equalizeHist, a global transform. A single bright window or a
+    partial shadow shifts the whole histogram and moves every pixel, producing
+    change where there is none. CLAHE normalises locally so a shadow on one
+    side does not corrupt the other.
+
+    The blur is not cosmetic, it is what makes this usable on a real camera.
+    Measured on two frames of the same clean sink taken one second apart by the
+    actual Pi, over the real sink ROI:
+
+        preprocessing              clean vs clean    clean vs dishes
+        CLAHE only                 p2 = 0.650        p2 = 0.020
+        CLAHE + 5px gaussian       p2 = 0.942        p2 = 0.010
+
+    Without it, webcam sensor noise and JPEG ringing drag the 2nd percentile of
+    an unchanged sink down to 0.650, well under any threshold that still
+    detects dishes, so an empty sink reads dirty. Synthetic test images are
+    smooth and never showed this. Blurring first costs almost nothing in
+    sensitivity (dishes still score ~0.01) and widens the margin from 0.63 to
+    0.93.
+    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-    return cv2.equalizeHist(gray)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    equalised = clahe.apply(gray)
+    if DENOISE_KERNEL > 1:
+        return cv2.GaussianBlur(equalised, (DENOISE_KERNEL, DENOISE_KERNEL), 0)
+    return equalised
 
 
-def _crop_roi(img, roi):
-    """crop image to roi [x1, y1, x2, y2]"""
+def crop_roi(img, roi):
     x1, y1, x2, y2 = roi
     h, w = img.shape[:2]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w, int(x2)), min(h, int(y2))
     return img[y1:y2, x1:x2]
 
 
-# -- reference frame --
+# -- yolo, optional, labels only --
 
-def load_reference():
-    global _reference
-    if _REF_PATH.exists():
-        _reference = cv2.imread(str(_REF_PATH))
-        if _reference is not None:
-            log.info("loaded reference image: %s", _REF_PATH)
-        else:
-            log.warning("reference file exists but couldnt read it")
-    else:
-        log.info("no reference image yet, set one via dashboard")
+_yolo = None
+_yolo_failed = False
 
 
-def save_reference(frame):
-    """save a frame as the clean reference"""
-    global _reference
-    os.makedirs(str(_DATA_DIR), exist_ok=True)
-    cv2.imwrite(str(_REF_PATH), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    _reference = frame.copy()
-    log.info("reference saved: %s", _REF_PATH)
-
-
-def get_reference():
-    return _reference
-
-
-def has_reference():
-    return _reference is not None
-
-
-# -- roi --
-
-def load_roi():
-    global _roi
-    if _ROI_PATH.exists():
-        try:
-            _roi = json.loads(_ROI_PATH.read_text())
-            log.info("loaded roi: %s", _roi)
-        except Exception as e:
-            log.warning("bad roi file: %s", e)
-
-
-def save_roi(roi_data):
-    """save roi. expects {"sink": [x1,y1,x2,y2], "counter": [x1,y1,x2,y2] (optional)}"""
-    global _roi
-    os.makedirs(str(_DATA_DIR), exist_ok=True)
-    _ROI_PATH.write_text(json.dumps(roi_data, indent=2))
-    _roi = roi_data
-    log.info("roi saved: %s", _roi)
-
-
-def get_roi():
-    return _roi
-
-
-def auto_detect_sink(frame):
-    """use yolo to find the sink bbox. returns [x1,y1,x2,y2] or None"""
-    if _model is None:
-        return None
-
-    results = _model(frame, verbose=False, classes=[SINK_CLASS])
-    for r in results:
-        if r.boxes is None or len(r.boxes) == 0:
-            continue
-        # pick highest confidence sink
-        confs = r.boxes.conf.cpu().numpy()
-        best = confs.argmax()
-        bbox = r.boxes.xyxy[best].cpu().numpy().astype(int).tolist()
-        log.info("auto-detected sink: %s (conf %.0f%%)", bbox, confs[best] * 100)
-        return bbox
-
-    return None
-
-
-# -- yolo (secondary, for labeling) --
-
-def load_model(path=None):
-    global _model
-    path = path or _MODEL_PATH
-    if YOLO_ENABLED:
-        log.info("loading yolo: %s", path)
+def _get_yolo():
+    global _yolo, _yolo_failed
+    if _yolo is not None or _yolo_failed:
+        return _yolo
+    try:
         from ultralytics import YOLO
-        _model = YOLO(path)
-        # warmup
-        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-        _model(dummy, verbose=False, classes=YOLO_CLASS_IDS)
-        log.info("yolo ready")
-    else:
-        log.info("yolo disabled")
-
-    load_reference()
-    load_roi()
+        path = os.environ.get("YOLO_MODEL_PATH", "yolov8n.pt")
+        _yolo = YOLO(path)
+        log.info("yolo loaded from %s", path)
+    except Exception as e:
+        _yolo_failed = True
+        log.warning("yolo unavailable, labels disabled: %s", e)
+    return _yolo
 
 
-def _run_yolo(frame):
-    """run yolo and return list of detection dicts"""
-    if _model is None:
-        return []
-
-    results = _model(frame, verbose=False, classes=YOLO_CLASS_IDS)
-    dets = []
-
-    for r in results:
-        if r.boxes is None or len(r.boxes) == 0:
-            continue
-        xyxy = r.boxes.xyxy.cpu().numpy().astype(int)
-        confs = r.boxes.conf.cpu().numpy()
-        clss = r.boxes.cls.cpu().numpy().astype(int)
-
-        for i in range(len(clss)):
-            cid = clss[i]
-            if cid == SINK_CLASS or cid not in ALL_CLASSES:
-                continue
-            if confs[i] < _CONFIDENCE:
-                continue
-            dets.append({
-                "label": ALL_CLASSES[cid],
-                "class_id": int(cid),
-                "confidence": round(float(confs[i]), 4),
-                "bbox": xyxy[i].tolist(),
-            })
-
-    return dets
+def _label(frame, roi, conf):
+    """Best-effort object labels inside the ROI. Never affects dirty/clean."""
+    model = _get_yolo()
+    if model is None:
+        return [], []
+    try:
+        crop = crop_roi(frame, roi)
+        res = model(crop, conf=conf, verbose=False)[0]
+        labels, dets = [], []
+        for b in res.boxes:
+            name = res.names[int(b.cls)]
+            c = float(b.conf)
+            labels.append(name)
+            dets.append({"label": name, "confidence": round(c, 3),
+                         "box": [round(float(v)) for v in b.xyxy[0].tolist()]})
+        return labels, dets
+    except Exception as e:
+        log.warning("yolo inference failed: %s", e)
+        return [], []
 
 
-# -- main detection --
+# -- main entry --
 
-def detect(frame):
+def detect(frame, calibration, ssim_threshold, yolo_enabled=True, confidence=0.40):
     """
-    main detection function. returns dict with:
-        dishes_found, ssim_score, labels, detections,
-        counter_dirty, counter_ssim (if enabled),
-        has_reference, has_roi, inference_ms
+    Decide whether the sink differs from its clean reference.
+
+    Raises NotCalibrated when calibration is unusable. There is deliberately no
+    default-clean return path; that bug is the whole reason for this rewrite.
     """
+    state = calibration.state()
+    if not state.valid:
+        raise NotCalibrated(state.reason)
+
     t0 = time.perf_counter()
+    ref, roi = calibration.reference, calibration.roi
+    sink = roi["sink"]
+
+    ref_g = prep_for_ssim(crop_roi(ref, sink))
+    cur_g = prep_for_ssim(crop_roi(frame, sink))
+
+    score, tiles = compute_ssim_tiled(ref_g, cur_g)
+    dishes = score < ssim_threshold
+
+    labels, dets = ([], [])
+    if yolo_enabled:
+        labels, dets = _label(frame, sink, confidence)
+
     result = {
-        "dishes_found": False,
-        "ssim_score": 1.0,
-        "labels": [],
-        "detections": [],
-        "counter_dirty": False,
-        "counter_ssim": 1.0,
-        "has_reference": has_reference(),
-        "has_roi": _roi is not None and "sink" in (_roi or {}),
+        "dishes_found": bool(dishes),
+        "ssim_score": round(score, 4),
+        "ssim_tiles": tiles,
+        "labels": labels,
+        "detections": dets,
+        "calibrated": True,
+        "inference_ms": round((time.perf_counter() - t0) * 1000, 1),
     }
 
-    # -- ssim comparison against reference --
-    if _reference is not None and _roi and "sink" in _roi:
-        ref_crop = _crop_roi(_reference, _roi["sink"])
-        cur_crop = _crop_roi(frame, _roi["sink"])
-
-        # make sure they're the same size (in case frame size changed)
-        if ref_crop.shape != cur_crop.shape:
-            cur_crop = cv2.resize(cur_crop, (ref_crop.shape[1], ref_crop.shape[0]))
-
-        ref_gray = _prep_for_ssim(ref_crop)
-        cur_gray = _prep_for_ssim(cur_crop)
-
-        score = compute_ssim(ref_gray, cur_gray)
-        result["ssim_score"] = round(score, 4)
-        result["dishes_found"] = score < SSIM_THRESHOLD
-
-        log.debug("ssim: %.4f (threshold: %.2f) -> %s",
-                  score, SSIM_THRESHOLD,
-                  "DIRTY" if result["dishes_found"] else "CLEAN")
-
-    elif _reference is None:
-        # no reference yet, cant compare. fall back to yolo-only
-        log.debug("no reference image, using yolo only")
-
-    # -- counter detection (optional) --
-    if COUNTER_ENABLED and _reference is not None and _roi and "counter" in _roi:
-        ref_crop = _crop_roi(_reference, _roi["counter"])
-        cur_crop = _crop_roi(frame, _roi["counter"])
-
-        if ref_crop.shape != cur_crop.shape:
-            cur_crop = cv2.resize(cur_crop, (ref_crop.shape[1], ref_crop.shape[0]))
-
-        ref_gray = _prep_for_ssim(ref_crop)
-        cur_gray = _prep_for_ssim(cur_crop)
-
-        counter_score = compute_ssim(ref_gray, cur_gray)
-        result["counter_ssim"] = round(counter_score, 4)
-        result["counter_dirty"] = counter_score < COUNTER_SSIM
-
-    # -- yolo labeling (secondary) --
-    if YOLO_ENABLED and _model is not None:
-        dets = _run_yolo(frame)
-
-        # filter to sink roi if we have one
-        if _roi and "sink" in _roi:
-            sink_box = _roi["sink"]
-            in_sink = []
-            for d in dets:
-                cx = (d["bbox"][0] + d["bbox"][2]) / 2
-                cy = (d["bbox"][1] + d["bbox"][3]) / 2
-                if sink_box[0] <= cx <= sink_box[2] and sink_box[1] <= cy <= sink_box[3]:
-                    d["location"] = "sink"
-                    in_sink.append(d)
-                elif COUNTER_ENABLED and _roi and "counter" in _roi:
-                    cbox = _roi["counter"]
-                    if cbox[0] <= cx <= cbox[2] and cbox[1] <= cy <= cbox[3]:
-                        d["location"] = "counter"
-                        in_sink.append(d)
-            dets = in_sink
-
-        result["detections"] = dets
-        result["labels"] = [d["label"] for d in dets]
-
-        # if no reference, use yolo as primary detection
-        if not has_reference():
-            result["dishes_found"] = len([d for d in dets
-                                           if d.get("location") != "counter"]) > 0
-
-    result["inference_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+    log.info("ssim worst-tile %.4f (threshold %.2f) -> %s%s",
+             score, ssim_threshold, "DIRTY" if dishes else "CLEAN",
+             f" labels={labels}" if labels else "")
     return result
 
 
-# -- annotation --
+# -- presentation helpers --
 
-def annotate_frame(frame, result, state_label=""):
-    """draw detection info on the frame"""
+SINK_CLASS = 71  # coco 'sink'
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+CLR_CLEAN = (120, 200, 90)
+CLR_DIRTY = (60, 160, 250)
+CLR_SINK = (200, 160, 90)
+
+
+def auto_detect_sink(frame):
+    """
+    Best-effort sink bbox from YOLO, to seed the ROI on first calibration.
+    Returns [x1, y1, x2, y2] or None. A None here is normal and just means the
+    user draws the box themselves.
+    """
+    model = _get_yolo()
+    if model is None:
+        return None
+    try:
+        for r in model(frame, verbose=False, classes=[SINK_CLASS]):
+            if r.boxes is None or len(r.boxes) == 0:
+                continue
+            confs = r.boxes.conf.cpu().numpy()
+            best = confs.argmax()
+            bbox = r.boxes.xyxy[best].cpu().numpy().astype(int).tolist()
+            log.info("auto-detected sink %s (conf %.0f%%)", bbox, confs[best] * 100)
+            return bbox
+    except Exception as e:
+        log.warning("sink auto-detect failed: %s", e)
+    return None
+
+
+def annotate_frame(frame, result, roi=None, state_label=""):
+    """Draw the ROI, score and labels onto a copy of the frame."""
     out = frame.copy()
-    h, w = out.shape[:2]
 
-    # sink roi
-    if _roi and "sink" in _roi:
-        x1, y1, x2, y2 = _roi["sink"]
-        color = CLR_DIRTY if result["dishes_found"] else CLR_CLEAN
+    if roi and "sink" in roi:
+        x1, y1, x2, y2 = roi["sink"]
+        color = CLR_DIRTY if result.get("dishes_found") else CLR_CLEAN
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-
-        # ssim score label
-        ssim_txt = f"SSIM: {result['ssim_score']:.3f}"
-        cv2.putText(out, ssim_txt, (x1 + 4, y2 - 8), FONT, 0.5, color, 1)
-
-        # "SINK" label
         cv2.putText(out, "SINK", (x1 + 4, y1 + 16), FONT, 0.5, CLR_SINK, 1)
+        cv2.putText(out, f"SSIM {result.get('ssim_score', 0):.3f}",
+                    (x1 + 4, y2 - 8), FONT, 0.5, color, 1)
 
-    # counter roi (if enabled)
-    if COUNTER_ENABLED and _roi and "counter" in _roi:
-        cx1, cy1, cx2, cy2 = _roi["counter"]
-        ccolor = CLR_COUNTER if result.get("counter_dirty") else CLR_CLEAN
-        cv2.rectangle(out, (cx1, cy1), (cx2, cy2), ccolor, 2)
-        cv2.putText(out, "COUNTER", (cx1 + 4, cy1 + 16), FONT, 0.5, CLR_COUNTER, 1)
-        ctxt = f"SSIM: {result.get('counter_ssim', 0):.3f}"
-        cv2.putText(out, ctxt, (cx1 + 4, cy2 - 8), FONT, 0.5, ccolor, 1)
-
-    # yolo detections
     for det in result.get("detections", []):
-        bx1, by1, bx2, by2 = det["bbox"]
-        label = f"{det['label']} {det['confidence']:.0%}"
-        cv2.rectangle(out, (bx1, by1), (bx2, by2), (0, 200, 0), 2)
-        cv2.putText(out, label, (bx1, by1 - 6), FONT, 0.45, (0, 200, 0), 1)
+        bx1, by1, bx2, by2 = det["box"]
+        cv2.rectangle(out, (bx1, by1), (bx2, by2), CLR_DIRTY, 1)
+        cv2.putText(out, f"{det['label']} {det['confidence']:.0%}",
+                    (bx1, max(12, by1 - 4)), FONT, 0.45, CLR_DIRTY, 1)
 
-    # state label (top left)
     if state_label:
-        # background bar
-        cv2.rectangle(out, (0, 0), (w, 28), (0, 0, 0), -1)
-        status = "DIRTY" if result["dishes_found"] else "CLEAN"
-        color = CLR_DIRTY if result["dishes_found"] else CLR_CLEAN
-        txt = f"{state_label} | {status} | SSIM {result['ssim_score']:.3f}"
-        if not result.get("has_reference"):
-            txt = f"{state_label} | NO REFERENCE SET"
-            color = (0, 165, 255)
-        cv2.putText(out, txt, (6, 20), FONT, 0.55, color, 1)
+        cv2.putText(out, state_label, (8, 22), FONT, 0.6, (255, 255, 255), 2)
+        cv2.putText(out, state_label, (8, 22), FONT, 0.6, (0, 0, 0), 1)
 
     return out

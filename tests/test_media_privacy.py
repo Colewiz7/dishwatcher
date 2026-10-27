@@ -1,0 +1,314 @@
+"""Authenticated users can watch remotely; anonymous clients cannot read media."""
+import asyncio
+import base64
+import sys
+import time
+from pathlib import Path
+
+import httpx
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
+
+
+@pytest.fixture(scope="module")
+def srv(tmp_path_factory):
+    import os
+    d = tmp_path_factory.mktemp("data")
+    os.environ["SAVE_DIR"] = str(d)
+    os.environ["DASHBOARD_PASSWORD"] = "pw"
+    os.environ["YOLO_ENABLED"] = "false"
+    import server
+    return server
+
+
+def request(srv, path, *, headers=None, client="10.42.0.20", method="GET", **kwargs):
+    async def run():
+        transport = httpx.ASGITransport(app=srv.app, client=(client, 1234))
+        async with httpx.AsyncClient(transport=transport, base_url="https://sink.colewiz.dev") as c:
+            return await c.request(method, path, headers=headers, **kwargs)
+    return asyncio.run(run())
+
+
+BASIC = {"Authorization": "Basic " + base64.b64encode(b"cole:pw").decode()}
+MEDIA = ["/people/abc/photo", "/thumbs/test.jpg", "/videos/test.mp4",
+         "/view/video/test.mp4", "/view/thumb/test.jpg", "/live.jpg"]
+
+
+@pytest.mark.parametrize("path", MEDIA)
+def test_anonymous_media_requires_login(srv, path):
+    assert request(srv, path).status_code == 401
+
+
+@pytest.mark.parametrize("path", MEDIA)
+def test_public_hostname_does_not_block_authenticated_media(srv, path):
+    response = request(srv, path, headers={**BASIC, "cf-ray": "test"})
+    assert response.status_code not in (401, 403)
+
+
+def test_proxy_identity_trusted_only_from_configured_network(srv, monkeypatch):
+    monkeypatch.setattr(srv, "TRUST_FORWARD_AUTH", True)
+    headers = {"x-authentik-username": "cole"}
+    assert request(srv, "/clips", headers=headers).status_code == 200
+    assert request(srv, "/clips", headers=headers, client="100.84.21.32").status_code == 401
+
+
+def test_missing_credentials_fail_closed(srv, monkeypatch):
+    monkeypatch.setattr(srv, "DASHBOARD_PASSWORD", "")
+    monkeypatch.setattr(srv, "TRUST_FORWARD_AUTH", False)
+    assert request(srv, "/live.jpg").status_code == 503
+
+
+def test_video_range_and_thumbnails_work_remotely(srv, monkeypatch, tmp_path):
+    payload = bytes(range(256)) * 20
+    video = tmp_path / "test.mp4"
+    video.write_bytes(payload)
+    monkeypatch.setattr(srv.storage, "get_video_path", lambda name: str(video))
+    response = request(srv, "/videos/test.mp4", headers={**BASIC, "Range": "bytes=100-199"})
+    assert response.status_code == 206
+    assert response.content == payload[100:200]
+    assert response.headers["content-range"] == f"bytes 100-199/{len(payload)}"
+    assert response.headers["cache-control"] == "private, no-store"
+
+
+def test_clip_list_keeps_storage_thumbnail_url(srv, monkeypatch):
+    monkeypatch.setattr(srv.storage, "list_videos", lambda limit: [
+        {"filename": "clip.mp4", "thumb_url": "/view/thumb/clip_thumb.jpg"}])
+    clip = request(srv, "/clips", headers=BASIC).json()["clips"][0]
+    assert clip["thumb_url"] == "/view/thumb/clip_thumb.jpg"
+    assert clip["url"] == "/videos/clip.mp4"
+
+
+def test_dashboard_uses_generated_sink_favicon(srv):
+    html = request(srv, "/", headers=BASIC).text
+    from html.parser import HTMLParser
+    class BrandParser(HTMLParser):
+        found = False
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == "img" and attrs.get("class") == "brand-mark":
+                assert attrs["src"] == "/static/sink-header-v3.png"
+                assert attrs["alt"] == ""  # Home link already has an accessible name.
+                assert attrs["width"] == attrs["height"] == "72"
+                self.found = True
+    parser = BrandParser()
+    parser.feed(html)
+    assert parser.found
+    for name in ("sink-eye-v3.ico", "sink-eye-v3.png", "sink-touch-icon-v2.png", "sink-header-v3.png"):
+        assert f'/static/{name}' in html
+        result = request(srv, f"/static/{name}", headers=BASIC)
+        assert result.status_code == 200
+        assert result.headers["content-type"].startswith("image/")
+        assert 100 < len(result.content) < 50000
+    icon = request(srv, "/static/sink-eye-v3.ico", headers=BASIC).content
+    assert icon[:6] == b"\x00\x00\x01\x00\x04\x00"  # four icon resolutions
+
+
+def test_eye_and_header_assets_have_transparent_backgrounds(srv):
+    import cv2
+    import numpy as np
+    for name in ("sink-eye-v3.png", "sink-header-v3.png"):
+        raw = request(srv, f"/static/{name}", headers=BASIC).content
+        image = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED)
+        assert image.shape[2] == 4
+        assert image[0, 0, 3] == 0 and image[-1, -1, 3] == 0
+        if name == "sink-eye-v3.png":
+            columns = np.where(image[:, :, 3].max(axis=0) > 128)[0]
+            # Tapered tips become antialiased at 32px; solid artwork still
+            # fills at least 7/8 of the tab canvas, unlike the full sink icon.
+            assert columns[-1] - columns[0] + 1 >= 28
+
+
+def test_clip_filters_apply_before_pagination(srv, monkeypatch):
+    monkeypatch.setattr(srv.storage, "list_videos", lambda limit: [
+        {"filename": "20260916_120000_blame.mp4"},
+        {"filename": "20260916_110000_blame.mp4"},
+        {"filename": "20260915_120000_blame.mp4"}])
+    monkeypatch.setattr(srv.people, "tag_of", lambda name: {"person_id": "a", "name": "A"} if "110000" in name else None)
+    result = request(srv, "/clips?day=2026-09-16&tagged=false&limit=1", headers=BASIC).json()
+    assert result["total"] == 1 and not result["has_more"]
+    assert result["clips"][0]["filename"] == "20260916_120000_blame.mp4"
+    result = request(srv, "/clips?person=a", headers=BASIC).json()
+    assert result["total"] == 1 and "110000" in result["clips"][0]["filename"]
+    result = request(srv, "/clips?limit=1&offset=1", headers=BASIC).json()
+    assert result["total"] == 3 and result["has_more"]
+    assert "110000" in result["clips"][0]["filename"]
+
+
+def test_clip_date_range_is_inclusive_and_rail_covers_all_pages(srv, monkeypatch):
+    monkeypatch.setattr(srv.storage, "list_videos", lambda limit: [
+        {"filename": "20260916_120000_blame.mp4"},
+        {"filename": "20260915_120000_blame.mp4"},
+        {"filename": "20260915_110000_blame.mp4"},
+        {"filename": "20260914_120000_blame.mp4"},
+        {"filename": "20260913_120000_blame.mp4"}])
+    monkeypatch.setattr(srv.people, "tag_of", lambda name: None)
+    url = "/clips?start_date=2026-09-14&end_date=2026-09-15&limit=1"
+    result = request(srv, url, headers=BASIC).json()
+    assert result["total"] == 3 and result["has_more"]
+    assert result["days"] == [
+        {"date": "2026-09-15", "count": 2, "offset": 0},
+        {"date": "2026-09-14", "count": 1, "offset": 2}]
+    jump = request(srv, url + "&offset=2", headers=BASIC).json()
+    assert jump["clips"][0]["filename"].startswith("20260914")
+    assert jump["days"] == result["days"] and not jump["has_more"]
+    assert request(srv, "/clips?start_date=2026-09-16", headers=BASIC).json()["total"] == 1
+    assert request(srv, "/clips?end_date=2026-09-13", headers=BASIC).json()["total"] == 1
+    assert request(srv, "/clips?start_date=2026-09-16&end_date=2026-09-14", headers=BASIC).status_code == 422
+    assert request(srv, "/clips?start_date=invalid", headers=BASIC).status_code == 422
+
+
+def test_session_parts_are_ordered_before_paging(srv, monkeypatch):
+    monkeypatch.setattr(srv.storage, "list_videos", lambda limit: [
+        {"filename": f"20260916_12000{part}_blame.mp4", "session_id": "s", "part": part}
+        for part in (4, 3, 2, 1)])
+    monkeypatch.setattr(srv.people, "tag_of", lambda name: None)
+    first = request(srv, "/clips?limit=2", headers=BASIC).json()
+    second = request(srv, "/clips?limit=2&offset=2", headers=BASIC).json()
+    assert [c["part"] for c in first["clips"]] == [1, 2]
+    assert [c["part"] for c in second["clips"]] == [3, 4]
+
+
+def test_clip_date_rail_respects_person_and_tag_filters(srv, monkeypatch):
+    monkeypatch.setattr(srv.storage, "list_videos", lambda limit: [
+        {"filename": "20260916_120000_blame.mp4"}, {"filename": "20260915_120000_blame.mp4"}])
+    monkeypatch.setattr(srv.people, "tag_of", lambda name: {"person_id": "a"} if name.startswith("20260915") else None)
+    result = request(srv, "/clips?person=a&tagged=true", headers=BASIC).json()
+    assert result["days"] == [{"date": "2026-09-15", "count": 1, "offset": 0}]
+    assert request(srv, "/clips?person=a&tagged=false", headers=BASIC).json()["days"] == []
+
+
+def test_chunk_upload_is_authenticated_and_does_not_change_detection(srv, monkeypatch):
+    import json
+    monkeypatch.setattr(srv, "API_KEY", "camera-key")
+    monkeypatch.setattr(srv.clip_processing, "normalize_video", lambda raw, rotation: (b"browser mp4", 59.8))
+    saved = {}
+    def save(raw, filename, **kwargs):
+        saved.update(kwargs)
+        return "new.mp4", "new.jpg"
+    monkeypatch.setattr(srv.storage, "save_video", save)
+    original = dict(srv.LAST_DETECTION)
+    files = {"video": ("clip.avi", b"jpeg stream", "video/x-msvideo")}
+    assert request(srv, "/camera/clip", method="POST", files=files).status_code == 401
+    response = request(srv, "/camera/clip", method="POST", files=files, headers={"X-API-Key": "camera-key"},
+                       data={"clip_metadata": json.dumps({"session_id": "test-session", "part": 2, "recorded_at": "2026-09-16T10:00:00+00:00"})})
+    assert response.status_code == 200
+    assert saved["metadata"]["duration_seconds"] == 59.8
+    assert saved["metadata"]["part"] == 2 and saved["rotation"] is None
+    assert srv.LAST_DETECTION == original
+    monkeypatch.setattr(srv, "API_KEY", None)
+    assert request(srv, "/camera/clip", method="POST", files=files).status_code == 503
+
+
+def test_live_snapshot_lease_freshness_and_auth(srv, monkeypatch):
+    live = {"wanted_until": 0, "frame": None, "frame_at": 0, "seq": 0}
+    monkeypatch.setattr(srv, "LIVE", live)
+    assert request(srv, "/live.jpg").status_code == 401
+    assert live["wanted_until"] == 0
+    assert request(srv, "/live.jpg", headers=BASIC).status_code == 503
+    assert 0 < live["wanted_until"] - time.time() <= srv.LIVE_LEASE_SEC
+    live.update(frame=b"jpeg bytes", frame_at=time.time(), seq=10)
+    response = request(srv, "/live.jpg", headers=BASIC)
+    assert response.content == b"jpeg bytes"
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["x-frame-seq"] == "10"
+    assert "no-store" in response.headers["cache-control"]
+    live["frame_at"] -= 30
+    assert request(srv, "/live.jpg", headers=BASIC).status_code == 503
+
+
+def test_camera_upload_still_requires_api_key(srv, monkeypatch):
+    monkeypatch.setattr(srv, "API_KEY", "camera-secret")
+    response = request(srv, "/live/frame", method="POST", files={"frame": ("test.jpg", b"jpeg", "image/jpeg")})
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize("rotation", [None, 0, 1, 2])
+def test_live_orientation_matches_snapshot_processing(srv, monkeypatch, rotation):
+    import cv2
+    import numpy as np
+    live = {"wanted_until": time.time() + 45, "frame": None, "frame_at": 0, "seq": 0}
+    monkeypatch.setattr(srv, "LIVE", live)
+    monkeypatch.setattr(srv, "API_KEY", "test-camera")
+    monkeypatch.setattr(srv, "_get_rotation", lambda: rotation)
+    original = np.zeros((80, 120, 3), np.uint8)
+    original[:40, :60] = (0, 0, 255)
+    original[40:, :60] = (255, 0, 0)
+    original[:40, 60:] = (0, 255, 0)
+    ok, jpeg = cv2.imencode(".jpg", original)
+    assert ok
+    response = request(srv, "/live/frame", method="POST", headers={"X-API-Key": "test-camera"},
+                       files={"frame": ("live.jpg", jpeg.tobytes(), "image/jpeg")})
+    assert response.status_code == 200
+    actual = cv2.imdecode(np.frombuffer(live["frame"], np.uint8), cv2.IMREAD_COLOR)
+    expected = srv._decode_frame(jpeg.tobytes())
+    assert actual.shape == expected.shape
+    assert np.abs(actual.astype(float) - expected).mean() < 5
+    assert live["seq"] == 1
+
+
+@pytest.mark.parametrize("payload,status", [(b"", 400), (b"not a jpeg", 422), (b"x" * (2 * 1024 * 1024 + 1), 413)],
+                         ids=["empty", "invalid-jpeg", "oversized"])
+def test_bad_preview_never_replaces_last_good_frame(srv, monkeypatch, payload, status):
+    live = {"wanted_until": 0, "frame": b"last good", "frame_at": 123, "seq": 9}
+    monkeypatch.setattr(srv, "LIVE", live)
+    monkeypatch.setattr(srv, "API_KEY", "test-camera")
+    response = request(srv, "/live/frame", method="POST", headers={"X-API-Key": "test-camera"},
+                       files={"frame": ("live.jpg", payload, "image/jpeg")})
+    assert response.status_code == status
+    assert live["frame"] == b"last good"
+    assert live["seq"] == 9
+
+
+def test_unchanged_preview_renews_lease_without_resending_jpeg(srv, monkeypatch):
+    live = {"wanted_until": 0, "frame": b"jpeg", "frame_at": time.time(), "seq": 7}
+    monkeypatch.setattr(srv, "LIVE", live)
+    first = request(srv, "/live.jpg", headers=BASIC)
+    token = first.headers["x-frame-id"]
+    response = request(srv, "/live.jpg", params={"after": token}, headers=BASIC)
+    assert response.status_code == 204
+    assert response.content == b""
+    assert live["wanted_until"] > time.time()
+    assert request(srv, "/live.jpg", params={"after": token}).status_code == 401
+    # Sequence numbers can repeat after a restart; timestamps must distinguish them.
+    live["frame_at"] += 0.001
+    assert request(srv, "/live.jpg", params={"after": token}, headers=BASIC).status_code == 200
+    live["frame_at"] -= 30
+    assert request(srv, "/live.jpg", params={"after": token}, headers=BASIC).status_code == 503
+
+
+def test_camera_report_ages_between_reports(srv, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    monkeypatch.setattr(srv, "CAMERA", {"seen": True, "stats": {"seconds_since_last_frame": 1},
+        "last_report": (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()})
+    cam = request(srv, "/status", headers=BASIC).json()["camera"]
+    assert cam["report_age_seconds"] >= 120
+    assert cam["seconds_since_last_frame"] >= 121
+
+
+def test_stored_snapshot_keeps_its_age_after_restart(srv, monkeypatch, tmp_path):
+    import os
+    frame = tmp_path / "old.jpg"
+    frame.write_bytes(b"jpeg")
+    captured = time.time() - 3600
+    os.utime(frame, (captured, captured))
+    monkeypatch.setattr(srv, "LAST_DETECTION", {})
+    monkeypatch.setattr(srv.storage, "get_latest_image_path", lambda: str(frame))
+    status = request(srv, "/status", headers=BASIC).json()
+    assert status["latest_frame_url"] == "/images/old.jpg"
+    assert 3600 <= status["latest_frame_age_seconds"] < 3605
+
+
+def test_reference_never_uses_an_annotated_dashboard_frame(srv, monkeypatch, tmp_path):
+    import numpy as np
+    from calibration import Calibration
+    calibration = Calibration(tmp_path)
+    monkeypatch.setattr(srv, "calib", calibration)
+    monkeypatch.setattr(srv, "LAST_RAW_FRAME", None)
+    assert request(srv, "/calibration/reference", headers=BASIC, method="POST").status_code == 409
+    raw = np.full((80, 80, 3), 100, dtype=np.uint8)
+    monkeypatch.setattr(srv, "LAST_RAW_FRAME", raw)
+    response = request(srv, "/calibration/reference", headers=BASIC, method="POST")
+    assert response.status_code == 200
+    assert response.json()["has_reference"]
+    assert np.array_equal(calibration.reference, raw)

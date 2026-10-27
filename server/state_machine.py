@@ -28,8 +28,12 @@ class DishState(str, Enum):
 CONSENSUS_WINDOW    = int(os.environ.get("CONSENSUS_WINDOW", "7"))
 CONSENSUS_THRESHOLD = int(os.environ.get("CONSENSUS_THRESHOLD", "5"))
 GRACE_MINUTES       = float(os.environ.get("GRACE_MINUTES", "90"))
+# Default under SAVE_DIR, not under $HOME. The container runs with a
+# read-only root filesystem and only /app/data is writable, so a home-relative
+# default crashes on boot with EROFS. DB_PATH still overrides.
 DB_PATH             = os.environ.get(
-    "DB_PATH", str(Path.home() / "dishwasher" / "dishwatcher.db"))
+    "DB_PATH",
+    str(Path(os.environ.get("SAVE_DIR", Path.home() / "dishwasher")) / "dishwatcher.db"))
 
 
 class ConsensusBuffer:

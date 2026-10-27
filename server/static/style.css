@@ -1,256 +1,436 @@
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg-0:#08090a;--bg-1:#0f1012;--bg-2:#161719;--bg-3:#1e1f22;--bg-4:#26272b;
-  --tx-0:#f0f0f2;--tx-1:#b8b9be;--tx-2:#8a8b92;--tx-3:#5c5d64;
-  --bd:#ffffff0d;--bd-h:#ffffff1a;
-  --accent:#2dd4bf;--accent-dim:#2dd4bf33;
-  --green:#22c55e;--green-bg:#22c55e18;--green-bd:#22c55e44;
-  --yellow:#eab308;--yellow-bg:#eab30818;--yellow-bd:#eab30844;
-  --orange:#f97316;--orange-bg:#f9731618;--orange-bd:#f9731644;
-  --red:#ef4444;--red-bg:#ef444418;--red-bd:#ef444444;
-  --font:system-ui,-apple-system,'Segoe UI',sans-serif;
-  --mono:'SF Mono','Menlo','Consolas',monospace;
-  --r:10px;--r-sm:6px;--r-lg:14px;
-}
-html{font-size:15px;-webkit-font-smoothing:antialiased}
-body{font-family:var(--font);color:var(--tx-1);background:var(--bg-0);min-height:100dvh;overflow-x:hidden}
-::-webkit-scrollbar{width:5px;height:5px}
-::-webkit-scrollbar-thumb{background:var(--bg-4);border-radius:3px}
+/* dishwatcher dashboard.
+ *
+ * Built on the TigerHub token set (tokens.css). The rules being followed, from
+ * that system's STYLE.md:
+ *   - roles not hexes; every colour here is a var()
+ *   - the surface ramp expresses nesting, not borders
+ *   - nothing rounded at 8 or below
+ *   - one hero per card; the hero is the status, not the telemetry
+ *   - status colour never travels without a text label
+ *   - a badge only when the status is NOT the default
+ *   - only changed values animate; status never pulses
+ */
 
-.wrap{max-width:1400px;margin:0 auto;padding:0 12px 80px}
-@media(min-width:768px){.wrap{padding:0 20px 40px}}
+@import url('tokens.css');
+@import url('https://fonts.googleapis.com/css2?family=Rubik:wght@300;400;500;600;700&display=swap');
 
-/* topbar */
-.topbar{
-  display:flex;align-items:center;gap:8px;padding:10px 0;
-  border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:100;background:var(--bg-0);
-}
-.logo{font-weight:700;font-size:1rem;color:var(--tx-0);letter-spacing:-.02em;white-space:nowrap}
-.logo span{opacity:.3;font-weight:400;font-size:.65rem;margin-left:3px}
-.topbar-spacer{flex:1}
-.conn{
-  display:flex;align-items:center;gap:5px;font-size:.65rem;
-  font-family:var(--mono);color:var(--tx-2);padding:3px 8px;
-  border-radius:20px;border:1px solid var(--bd);background:var(--bg-2);
-}
-.dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
-.dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}
-.dot.off{background:var(--red);animation:blink 1.5s infinite}
-@keyframes blink{50%{opacity:.3}}
-.tbtn{
-  background:none;border:1px solid var(--bd);color:var(--tx-2);
-  font-family:var(--font);font-size:.7rem;padding:4px 10px;
-  border-radius:20px;cursor:pointer;transition:all .15s;white-space:nowrap;
-}
-.tbtn:hover{border-color:var(--bd-h);color:var(--tx-1);background:var(--bg-3)}
-.tbtn.on{border-color:var(--accent);color:var(--accent)}
+* { box-sizing: border-box; margin: 0; padding: 0; }
 
-/* state hero */
-.hero{display:flex;align-items:center;gap:14px;padding:14px 0 10px}
-.orb{
-  width:44px;height:44px;border-radius:50%;flex-shrink:0;
-  display:flex;align-items:center;justify-content:center;font-size:1.2rem;
-  transition:all .4s;position:relative;
-}
-.orb::after{content:'';position:absolute;inset:-3px;border-radius:50%;border:2px solid transparent;transition:border-color .4s}
-.orb.CLEAR{background:var(--green-bg);color:var(--green)}.orb.CLEAR::after{border-color:var(--green-bd)}
-.orb.DETECTED{background:var(--yellow-bg);color:var(--yellow)}.orb.DETECTED::after{border-color:var(--yellow-bd)}
-.orb.CONFIRMED{background:var(--orange-bg);color:var(--orange)}.orb.CONFIRMED::after{border-color:var(--orange-bd)}
-.orb.ALERTED{background:var(--red-bg);color:var(--red);animation:glow 2s infinite}.orb.ALERTED::after{border-color:var(--red-bd)}
-@keyframes glow{50%{box-shadow:0 0 16px var(--red-bd)}}
-.hero h1{font-size:1.2rem;font-weight:600;color:var(--tx-0);letter-spacing:-.02em;line-height:1.2}
-.hero p{font-size:.75rem;color:var(--tx-2);margin-top:1px}
-
-/* ssim meter */
-.meter{height:5px;border-radius:3px;background:var(--bg-3);margin:6px 0 3px;overflow:hidden}
-.meter-fill{height:100%;border-radius:3px;transition:width .4s,background .4s}
-.meter-labels{display:flex;justify-content:space-between;font-size:.62rem;font-family:var(--mono);color:var(--tx-3)}
-
-/* grid */
-.grid{display:grid;grid-template-columns:1fr;gap:12px;margin-top:6px}
-@media(min-width:768px){.grid{grid-template-columns:1fr 340px}}
-@media(min-width:1100px){.grid{grid-template-columns:1fr 380px}}
-
-/* card */
-.card{background:var(--bg-1);border:1px solid var(--bd);border-radius:var(--r-lg);padding:14px}
-.card-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
-.card-t{font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--tx-3)}
-.badge{font-family:var(--mono);font-size:.62rem;color:var(--tx-2);background:var(--bg-3);padding:2px 6px;border-radius:4px}
-
-/* feed */
-.feed{position:relative;border-radius:var(--r);overflow:hidden;background:var(--bg-2);cursor:pointer}
-.feed img,.feed video{width:100%;display:block;aspect-ratio:4/3;object-fit:cover}
-.feed-bar{
-  position:absolute;bottom:0;left:0;right:0;padding:8px 10px;
-  background:linear-gradient(transparent,#000a);display:flex;align-items:center;justify-content:space-between;
-}
-.feed-bar span{font-family:var(--mono);font-size:.62rem;color:#fffc}
-.feed-empty{
-  aspect-ratio:4/3;display:flex;align-items:center;justify-content:center;
-  color:var(--tx-3);font-size:.8rem;text-align:center;padding:20px;line-height:1.5;
+body {
+  font-family: var(--font);
+  background: var(--surface);
+  color: var(--on-surface);
+  line-height: 1.5;
+  padding: var(--gutter);
+  max-width: 1100px;
+  margin: 0 auto;
 }
 
-/* reference button */
-.ref-btn{
-  width:100%;padding:10px;border-radius:var(--r-sm);cursor:pointer;
-  font-family:var(--font);font-size:.8rem;font-weight:500;
-  border:1px dashed var(--accent-dim);color:var(--accent);background:none;
-  transition:all .15s;margin-top:8px;
-}
-.ref-btn:hover{background:var(--accent-dim);border-style:solid}
-.ref-btn.has-ref{border-color:var(--green-bd);color:var(--green);border-style:solid}
+/* ---------- header ---------- */
 
-/* timeline */
-.timeline{display:flex;flex-direction:column;gap:4px;max-height:55vh;overflow-y:auto;-webkit-overflow-scrolling:touch}
-.tl-item{
-  display:flex;gap:10px;padding:8px;border-radius:var(--r-sm);
-  cursor:pointer;transition:background .12s;border:1px solid transparent;
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gutter);
+  padding: 18px 6px 22px;
+  flex-wrap: wrap;
 }
-.tl-item:hover,.tl-item:active{background:var(--bg-3)}
-.tl-item.active{border-color:var(--accent-dim);background:var(--bg-2)}
-.tl-thumb{width:64px;height:48px;border-radius:4px;object-fit:cover;flex-shrink:0;background:var(--bg-3)}
-.tl-meta{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center}
-.tl-time{font-family:var(--mono);font-size:.62rem;color:var(--tx-3)}
-.tl-status{font-size:.75rem;color:var(--tx-1);margin-top:1px}
-.tl-labels{font-family:var(--mono);font-size:.58rem;color:var(--tx-2);margin-top:1px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tl-tag{
-  font-size:.58rem;font-family:var(--mono);padding:1px 5px;border-radius:3px;
-  align-self:flex-start;margin-top:3px;flex-shrink:0;
+.brand { display: flex; align-items: baseline; gap: 10px; }
+.brand h1 {
+  font-size: 1.45rem;
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.02em;
 }
-.tl-tag.dirty{background:var(--red-bg);color:var(--red)}
-.tl-tag.clean{background:var(--green-bg);color:var(--green)}
-.tl-tag.video{background:var(--accent-dim);color:var(--accent)}
+.brand .ver {
+  font-size: .75rem;
+  color: var(--on-surface-variant);
+  font-weight: var(--weight-regular);
+}
+.topbar-actions { display: flex; gap: 8px; align-items: center; }
 
-/* video player */
-.vplayer{border-radius:var(--r);overflow:hidden;background:#000;margin-top:8px;display:none}
-.vplayer video{width:100%;display:block;max-height:50vh}
-.vplayer.show{display:block}
+/* ---------- cards & the surface ramp ---------- */
 
-/* consensus dots */
-.consensus{display:flex;gap:4px;margin:6px 0;flex-wrap:wrap}
-.cdot{
-  width:22px;height:22px;border-radius:50%;border:2px solid var(--bg-4);
-  display:flex;align-items:center;justify-content:center;
-  font-family:var(--mono);font-size:.5rem;transition:all .3s;
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: var(--gutter);
 }
-.cdot.y{background:var(--green-bg);border-color:var(--green-bd);color:var(--green)}
-.cdot.n{background:var(--bg-2);color:var(--tx-3)}
-.cdot.e{border:2px dashed var(--bg-4)}
+.card {
+  background: var(--surface-container-low);
+  border-radius: var(--radius-card);
+  padding: var(--pad-card);
+}
+.card.wide { grid-column: 1 / -1; }
+.card h2 {
+  font-size: .78rem;
+  font-weight: var(--weight-medium);
+  text-transform: uppercase;
+  letter-spacing: .09em;
+  color: var(--on-surface-variant);
+  margin-bottom: 16px;
+}
+/* things inside a card step up the ramp rather than gaining a border */
+.inner {
+  background: var(--surface-container-high);
+  border-radius: var(--radius-inner);
+  padding: 16px 18px;
+}
 
-/* timer */
-.timer{font-family:var(--mono);font-size:1.6rem;font-weight:600;color:var(--tx-0);padding:4px 0}
-.timer.urgent{color:var(--red);animation:pulse-text 1s infinite}
-@keyframes pulse-text{50%{opacity:.5}}
-.timer-sub{font-size:.7rem;color:var(--tx-2)}
+/* ---------- the hero. one per card. ---------- */
 
-/* stats */
-.sgrid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-.sbox{background:var(--bg-2);border-radius:var(--r-sm);padding:9px;border:1px solid var(--bd)}
-.sbox-l{font-size:.6rem;color:var(--tx-3);text-transform:uppercase;letter-spacing:.04em}
-.sbox-v{font-family:var(--mono);font-size:1rem;font-weight:600;color:var(--tx-0);margin-top:1px}
-.sbox-v.sm{font-size:.8rem}
+.hero { text-align: center; padding: 10px 0 4px; }
+.hero .value {
+  font-size: 3.6rem;
+  font-weight: var(--weight-light);   /* oversized AND light */
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+  display: block;
+}
+.hero .label {
+  font-size: .72rem;
+  color: var(--on-surface-variant);
+  text-transform: uppercase;
+  letter-spacing: .12em;
+  margin-top: 8px;
+}
+.hero.state-clear   .value { color: var(--ok); }
+.hero.state-dirty   .value { color: var(--warn); }
+.hero.state-alerted .value { color: var(--bad); }
+.hero.state-unknown .value { color: var(--on-surface-variant); }
 
-/* events */
-.elist{max-height:240px;overflow-y:auto}
-.erow{
-  display:flex;align-items:center;gap:8px;padding:5px 6px;font-size:.72rem;
-  border-bottom:1px solid var(--bd);
-}
-.erow:last-child{border-bottom:none}
-.edot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
-.edot.d{background:var(--orange)}.edot.c{background:var(--green)}.edot.s{background:var(--accent)}
-.etime{font-family:var(--mono);font-size:.58rem;color:var(--tx-3);margin-left:auto;white-space:nowrap}
+/* ---------- status pills. full pills, always with a word. ---------- */
 
-/* admin */
-.abtn{
-  font-family:var(--mono);font-size:.65rem;font-weight:500;
-  padding:6px 10px;border-radius:var(--r-sm);cursor:pointer;
-  border:1px solid var(--bd);background:var(--bg-2);color:var(--tx-1);transition:all .15s;
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border-radius: var(--radius-pill);
+  padding: 6px 14px;
+  font-size: .78rem;
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
 }
-.abtn:hover{border-color:var(--accent);color:var(--accent)}
-.abtn.warn:hover{border-color:var(--red);color:var(--red)}
+.pill .dot {
+  width: 8px; height: 8px;
+  border-radius: var(--radius-pill);
+  background: currentColor;
+  flex: none;
+}
+.pill-ok   { background: var(--ok-container);   color: var(--on-ok); }
+.pill-warn { background: var(--warn-container); color: var(--on-warn); }
+.pill-bad  { background: var(--bad-container);  color: var(--bad); }
+.pill-mute { background: var(--surface-container-high); color: var(--on-surface-variant); }
 
-/* chart */
-.chart-box{height:150px;position:relative}
+/* ---------- the calibration banner ----------
+   This is the whole reason v2 exists. When calibration is invalid the app must
+   be unmistakably broken, not quietly reporting a clean sink. */
 
-/* toast */
-.toasts{position:fixed;top:50px;right:12px;z-index:200;display:flex;flex-direction:column;gap:6px}
-.toast{
-  background:var(--bg-2);border:1px solid var(--bd);border-radius:var(--r);
-  padding:10px 14px;font-size:.75rem;color:var(--tx-1);
-  display:flex;align-items:center;gap:8px;animation:tin .2s ease;
-  min-width:200px;box-shadow:0 6px 16px #0004;
+.banner {
+  border-radius: var(--radius-card);
+  padding: 22px var(--pad-card);
+  margin-bottom: var(--gutter);
+  background: var(--bad-container);
+  color: var(--bad);
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
 }
-.toast.out{animation:tout .2s ease forwards}
-@keyframes tin{from{opacity:0;transform:translateY(-8px)}}
-@keyframes tout{to{opacity:0;transform:translateY(-8px)}}
+.banner[hidden] { display: none; }
+.banner .icon { font-size: 1.6rem; line-height: 1; flex: none; }
+.banner h3 {
+  font-size: 1rem;
+  font-weight: var(--weight-semibold);
+  margin-bottom: 4px;
+}
+.banner p { font-size: .88rem; opacity: .9; }
+.banner .reason {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .8rem;
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-small);
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+}
 
-/* lightbox */
-.lb{position:fixed;inset:0;z-index:300;background:#000e;display:none;align-items:center;justify-content:center;cursor:zoom-out}
-.lb.open{display:flex}
-.lb img,.lb video{max-width:95vw;max-height:90vh;border-radius:var(--r)}
+/* ---------- buttons ---------- */
 
-/* mobile bottom nav */
-.bnav{
-  display:none;position:fixed;bottom:0;left:0;right:0;
-  background:var(--bg-1);border-top:1px solid var(--bd);
-  padding:4px 0 env(safe-area-inset-bottom,4px);z-index:100;
+button {
+  font-family: var(--font);
+  font-size: .82rem;
+  font-weight: var(--weight-medium);
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: 10px 18px;
+  cursor: pointer;
+  background: var(--surface-container-high);
+  color: var(--on-surface);
+  transition: filter var(--motion-swap-in) var(--ease);
 }
-@media(max-width:767px){.bnav{display:flex}}
-.bnav-btn{
-  flex:1;display:flex;flex-direction:column;align-items:center;gap:1px;
-  padding:4px;color:var(--tx-3);font-size:.55rem;cursor:pointer;
-  background:none;border:none;font-family:var(--font);
-}
-.bnav-btn.on{color:var(--accent)}
-.bnav-btn svg{width:18px;height:18px}
+button:hover { filter: brightness(0.95); }
+button.primary { background: var(--primary); color: var(--on-primary); }
+button.danger  { background: var(--bad-container); color: var(--bad); }
+button:disabled { opacity: .45; cursor: not-allowed; }
 
-/* mobile panels */
-.panel{display:block}
-@media(max-width:767px){.panel{display:none}.panel.on{display:block}}
+/* ---------- readings ---------- */
 
-/* settings panel */
-.settings-group{margin-bottom:16px}
-.settings-group-title{
-  font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;
-  color:var(--accent);margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--bd);
+.readings { display: flex; flex-direction: column; gap: 10px; }
+.reading {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
 }
-.setting-row{
-  display:flex;align-items:center;gap:12px;padding:8px 0;
-  border-bottom:1px solid var(--bd);
+.reading .k { font-size: .82rem; color: var(--on-surface-variant); }
+.reading .v {
+  font-size: .92rem;
+  font-weight: var(--weight-medium);
+  font-variant-numeric: tabular-nums;
 }
-.setting-row:last-child{border-bottom:none}
-.setting-label{flex:1;min-width:0}
-.setting-label .name{font-size:.8rem;color:var(--tx-1)}
-.setting-label .desc{font-size:.65rem;color:var(--tx-3);margin-top:1px}
-.setting-ctrl{flex-shrink:0;display:flex;align-items:center;gap:6px}
-.setting-ctrl input[type=number],
-.setting-ctrl input[type=text],
-.setting-ctrl input[type=password]{
-  width:100px;padding:5px 8px;border-radius:var(--r-sm);
-  border:1px solid var(--bd);background:var(--bg-2);color:var(--tx-0);
-  font-family:var(--mono);font-size:.75rem;
+
+/* only changed values animate */
+.v.changed { animation: swap var(--motion-value) var(--ease); }
+@keyframes swap {
+  0%   { opacity: 0; transform: translateY(-3px); }
+  100% { opacity: 1; transform: none; }
 }
-.setting-ctrl input[type=text],
-.setting-ctrl input[type=password]{width:180px}
-.setting-ctrl select{
-  padding:5px 8px;border-radius:var(--r-sm);
-  border:1px solid var(--bd);background:var(--bg-2);color:var(--tx-0);
-  font-family:var(--mono);font-size:.75rem;
+
+/* ---------- ssim heatmap ---------- */
+
+.heat {
+  display: grid;
+  gap: 3px;
+  aspect-ratio: 1;
+  max-width: 190px;
+  margin: 0 auto;
 }
-.toggle{
-  width:36px;height:20px;border-radius:10px;background:var(--bg-4);
-  position:relative;cursor:pointer;transition:background .2s;flex-shrink:0;
+.heat i {
+  border-radius: 6px;      /* deliberately below the 8px floor: these are data
+                              cells in a plot, not UI containers */
+  background: var(--ok);
 }
-.toggle.on{background:var(--accent)}
-.toggle::after{
-  content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;
-  border-radius:50%;background:#fff;transition:transform .2s;
+
+/* ---------- live view ---------- */
+
+.frame {
+  width: 100%;
+  height: auto;              /* the frame's own aspect ratio, not a forced one */
+  border-radius: var(--radius-inner);
+  display: block;
+  background: var(--surface-container-highest);
+  /* Deliberately NOT object-fit: cover with a fixed aspect-ratio. That crops
+     the sides of a 16:9 frame into a 4:3 box, so a click on the overlay maps
+     to the wrong pixel and the sink area you draw is not the one you get. The
+     image is shown whole, at its own ratio, so the overlay maps 1:1. */
 }
-.toggle.on::after{transform:translateX(16px)}
-.setting-val{font-family:var(--mono);font-size:.68rem;color:var(--tx-2);min-width:32px;text-align:right}
-@media(max-width:767px){
-  .setting-row{flex-wrap:wrap}
-  .setting-ctrl{width:100%}
-  .setting-ctrl input[type=text],.setting-ctrl input[type=password]{width:100%}
+
+/* ---------- events ---------- */
+
+.events { display: flex; flex-direction: column; gap: 6px; max-height: 380px; overflow-y: auto; }
+.event {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 16px;
+  background: var(--surface-container-high);
+  border-radius: var(--radius-inner);
+  font-size: .85rem;
 }
+.event .when {
+  font-size: .74rem;
+  color: var(--on-surface-variant);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+.event .what { flex: 1; }
+
+/* ---------- skeleton: reserves the final layout ---------- */
+
+.skeleton {
+  background: linear-gradient(90deg,
+    var(--surface-container-high) 0%,
+    var(--surface-container-highest) 50%,
+    var(--surface-container-high) 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+  border-radius: var(--radius-inner);
+  color: transparent !important;
+}
+@keyframes shimmer { to { background-position: -200% 0; } }
+
+.stale {
+  font-size: .74rem;
+  color: var(--on-surface-variant);
+  text-align: center;
+  padding-top: 14px;
+}
+
+.empty {
+  text-align: center;
+  padding: 30px 20px;
+  color: var(--on-surface-variant);
+  font-size: .86rem;
+}
+
+/* reduced motion jumps to the final state rather than slowing down */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}
+
+@media (max-width: 560px) {
+  body { padding: 6px; }
+  .card { padding: 20px; }
+  .hero .value { font-size: 2.9rem; }
+}
+
+
+/* ---------- live view ----------
+   The badge is a static pill, not a pulsing dot: the system's rule is that
+   status never blinks, and "live" is a status. */
+
+.viewport { position: relative; }
+.live-badge {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  font-size: .68rem;
+  letter-spacing: .08em;
+}
+.live-badge[hidden] { display: none; }
+#live[hidden], #frame[hidden] { display: none; }
+
+
+/* ---------- reference pair ---------- */
+
+.refgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--gutter);
+}
+.refimg { aspect-ratio: auto; }
+@media (max-width: 620px) { .refgrid { grid-template-columns: 1fr; } }
+
+
+/* ---------- roster ---------- */
+
+.roster { display: flex; flex-wrap: wrap; gap: var(--gutter); }
+.person {
+  background: var(--surface-container-high);
+  border-radius: var(--radius-inner);
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 200px;
+}
+.avatar {
+  width: 46px; height: 46px;
+  border-radius: var(--radius-pill);
+  object-fit: cover;
+  background: var(--surface-container-highest);
+  flex: none;
+}
+.avatar.placeholder {
+  display: grid;
+  place-items: center;
+  font-size: 1.05rem;
+  font-weight: var(--weight-medium);
+  color: var(--on-surface-variant);
+}
+.person .who { flex: 1; min-width: 0; }
+.person .nm {
+  font-weight: var(--weight-medium);
+  font-size: .92rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.person .ct { font-size: .74rem; color: var(--on-surface-variant); }
+.person .acts { display: flex; gap: 6px; }
+.iconbtn {
+  padding: 6px 11px;
+  font-size: .72rem;
+  background: var(--surface-container-highest);
+}
+
+.text-in {
+  font-family: var(--font);
+  font-size: .85rem;
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: 10px 16px;
+  background: var(--surface-container-high);
+  color: var(--on-surface);
+  min-width: 180px;
+}
+.text-in::placeholder { color: var(--on-surface-variant); }
+
+/* ---------- clips ---------- */
+
+.clips {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--gutter);
+}
+.clip {
+  background: var(--surface-container-high);
+  border-radius: var(--radius-inner);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.clip video, .clip .poster {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  background: var(--surface-container-highest);
+  display: block;
+}
+.clip .meta { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+.clip .when { font-size: .78rem; color: var(--on-surface-variant); }
+.clip .tagrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.clip select {
+  font-family: var(--font);
+  font-size: .76rem;
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: 7px 12px;
+  background: var(--surface-container-lowest);
+  color: var(--on-surface);
+  flex: 1;
+  min-width: 120px;
+}
+
+
+/* ---------- roi editor ----------
+   A canvas sitting exactly over the frame. Setting the sink area used to mean
+   typing four pixel coordinates into a prompt, which is both unpleasant and
+   easy to get wrong, and a wrong ROI breaks detection silently. */
+
+#roi-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: var(--radius-inner);
+  cursor: crosshair;
+  touch-action: none;      /* so a drag draws instead of scrolling the page */
+}
+#roi-canvas[hidden] { display: none; }
+
+.roi-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  background: var(--surface-container-lowest);
+  color: var(--on-surface);
+  border-radius: var(--radius-pill);
+  padding: 8px 16px;
+  font-size: .78rem;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.roi-hint[hidden] { display: none; }

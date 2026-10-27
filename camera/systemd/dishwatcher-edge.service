@@ -1,4 +1,3 @@
-# edit User, WorkingDirectory, ExecStart, and Environment lines before installing
 [Unit]
 Description=dishwatcher edge (pi camera monitor)
 After=network-online.target
@@ -6,14 +5,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=YOUR_USERNAME
-WorkingDirectory=/home/YOUR_USERNAME/dishwatcher-edge
-ExecStart=/home/YOUR_USERNAME/dishwatcher-edge/venv/bin/python watcher.py
+User=cole
+WorkingDirectory=/home/cole/dishwatcher/camera
+ExecStart=/home/cole/dishwatcher/camera/venv/bin/python watcher.py
+EnvironmentFile=/home/cole/dishwatcher/camera/.env
 Restart=always
 RestartSec=10
-EnvironmentFile=/home/YOUR_USERNAME/dishwatcher-edge/.env
-CPUQuota=50%
+
+# The 3B+ shares one usb 2.0 bus between the camera and ethernet, so leave it
+# headroom. The watcher is mostly idle between motion events anyway.
+CPUQuota=60%
 OOMPolicy=continue
+
+# The capture module reopens the device itself and only escalates to a usb
+# re-authorise after repeated failures, so it needs write access to that one
+# sysfs attribute. v1 did the re-authorise in ExecStartPre, which only ran at
+# start and so never fixed a wedge that happened later.
+ReadWritePaths=/sys/bus/usb/devices
 
 [Install]
 WantedBy=multi-user.target

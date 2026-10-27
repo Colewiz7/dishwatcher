@@ -1,0 +1,4 @@
+# Optional. Only the dashboard's object labels depend on this; the dirty/clean
+# decision is SSIM and does not. Pulls the full torch stack, roughly 2-3 GB.
+# Enable with: docker build --build-arg WITH_YOLO=true
+ultralytics>=8.0.200
